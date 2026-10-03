@@ -2,11 +2,19 @@
   "name": "dsh-web-tray",
   "description": "DSH plugin: Windows tray + desktop shortcut for dsh web in WSL, with switchable auto start/stop and live status (fork of dsh-wsl-tray)",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "license": "MIT",
+  "author": "p455enger",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/p455enger/dsh-web-tray.git"
+  },
+  "homepage": "https://github.com/p455enger/dsh-web-tray#readme",
+  "bugs": {
+    "url": "https://github.com/p455enger/dsh-web-tray/issues"
+  },
   "exports": {
     ".": {
       "types": "./lib/types/index.d.ts",
