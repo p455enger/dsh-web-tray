@@ -1,16 +1,25 @@
 import { describe, expect, it } from 'vitest'
-import { buildStartScript, buildStopScript, buildTrayScript, buildTrayVbs, DEFAULT_TRAY_CONFIG, TRAY_LOG_NAME, TRAY_STATUS_NAME } from '../src/artifacts.ts'
-import { configuredPathProblem, sourceBuildProblem, wslPathToWindowsPath, webUrlFor, type StartCommand } from '../src/service.ts'
+import {
+  LAUNCHER_SCRIPT_NAME,
+  TRAY_ICON_FILE_NAME,
+  buildLauncherScript,
+  buildStartScript,
+  buildStopScript,
+  buildTrayScript,
+} from '../src/artifacts.ts'
+import { configuredPathProblem, wslPathToWindowsPath, webUrlFor } from '../src/service.ts'
+
+const LAUNCH = {
+  distro: 'Ubuntu',
+  webUrl: 'http://127.0.0.1:3080',
+  shortcutName: 'DeepSeek Harness',
+  wslStartScript: '~/.dsh/dsh-web-tray/start.sh',
+  wslStopScript: '~/.dsh/dsh-web-tray/stop.sh',
+  wslStartLogPath: '/home/me/.dsh/dsh-web-tray/start.log',
+}
 
 function trayScript(): string {
-  return buildTrayScript({
-    distro: 'Ubuntu',
-    webUrl: 'http://127.0.0.1:3080',
-    shortcutName: 'DeepSeek Harness',
-    wslStartScript: '~/.dsh/dsh-web-tray/start.sh',
-    wslStopScript: '~/.dsh/dsh-web-tray/stop.sh',
-    wslStartLogPath: '/home/me/.dsh/dsh-web-tray/start.log',
-  })
+  return buildTrayScript(LAUNCH)
 }
 
 describe('generated scripts', () => {
@@ -37,8 +46,8 @@ describe('generated scripts', () => {
       bakedCli: null,
       webUrl: 'http://127.0.0.1:3080',
     })
-    // PID file written before exec: exec keeps the shell PID, so stop.sh can
-    // stop exactly the instance this script launched.
+    // PID file written before exec: exec keeps the shell PID, so the manual
+    // stop.sh can stop exactly the instance this script launched.
     expect(script).toContain('PID_FILE="$HOME/.dsh/dsh-web-tray/dsh.pid"')
     expect(script).toContain('echo $$ > "$PID_FILE"')
     // Dependency chain so a minimal distro still detects a live DSH.
@@ -51,6 +60,11 @@ describe('generated scripts', () => {
     const stop = buildStopScript()
     expect(stop).toContain('PID_FILE="$HOME/.dsh/dsh-web-tray/dsh.pid"')
     expect(stop).toContain('kill -0 "$pid"')
+    // A stale PID file plus a reused PID must not kill an unrelated process: the
+    // command line is verified before anything is signalled.
+    expect(stop).toContain('is_dsh_web')
+    expect(stop).toContain('/proc/$1/cmdline')
+    expect(stop).toContain('is not a DSH web process; leaving it alone')
     // The bracketed class means the literal pattern text in the wsl.exe/bash
     // command line never matches the regex.
     expect(stop).toContain("pkill -f '[b]in\\.js web'")
@@ -59,139 +73,243 @@ describe('generated scripts', () => {
     expect(new RegExp('[b]in\\.js web').test('node /x/.npm-global/lib/node_modules/@deepseek-ai/dsh/lib/bin.js web --no-open')).toBe(true)
   })
 
-  it('builds the hidden wscript launcher next to the tray script', () => {
-    const vbs = buildTrayVbs()
-    expect(vbs).toContain('CreateObject("WScript.Shell")')
-    expect(vbs).toContain('dsh-web-tray.ps1')
-    expect(vbs).toContain('0, False')
+  it('builds a JScript launcher that does not depend on the .vbs engine mapping', () => {
+    const launcher = buildLauncherScript()
+    expect(LAUNCHER_SCRIPT_NAME.endsWith('.js')).toBe(true)
+    // wscript.exe is the GUI-subsystem host that keeps the console away. The
+    // launcher must not be a plain .vbs: a machine with no engine mapped to
+    // .vbs (VBScript is a Feature-on-Demand since Windows 11 24H2) cannot run
+    // one at all, and that is what killed the desktop shortcut.
+    expect(launcher).toContain("new ActiveXObject('WScript.Shell')")
+    expect(launcher).toContain('dsh-web-tray.ps1')
+    expect(launcher).toContain(', 0, false)')
+    expect(launcher).toContain('-WindowStyle Hidden')
+    expect(launcher).toContain('WindowsPowerShell')
+    expect(launcher).not.toContain('WScript.Echo')
+  })
+})
+
+describe('generated tray helper', () => {
+  it('offers exactly the two desktop-app menu entries and nothing else', () => {
+    const script = trayScript()
+    expect(script).toContain("$openLabel = '打开 DeepSeek Harness'")
+    expect(script).toContain("$exitLabel = '退出 DeepSeek Harness'")
+    expect(script).toContain('$menu.Items.Add($openLabel)')
+    expect(script).toContain('$menu.Items.Add($exitLabel)')
+    expect(script).toContain('New-Object System.Windows.Forms.ToolStripSeparator')
+    expect(script).toContain('$openItem.Add_Click({ Start-OpenFlow })')
+    // The exit entry says "exit DeepSeek Harness", so it also stops the WSL
+    // instance — hidden and never awaited; the self test calls Close-Tray
+    // without the switch so a test run can never stop a real DSH.
+    expect(script).toContain('$exitItem.Add_Click({ Close-Tray -StopDsh })')
+    expect(script).toContain('function Stop-Dsh')
+    expect(script).toContain("'wsl.exe -d ' + $distro + ' -- bash -lc \"' + $wslStopScript + '\"'")
+    expect(script).toContain('function Close-Tray([switch]$StopDsh)')
+    expect(script).toContain("Close-Tray\n  return")
+    // Left click shows DSH, right click opens the menu — the desktop app's tray
+    // reacts to the same two gestures.
+    expect(script).toContain('$tray.Add_MouseUp({')
+    expect(script).toContain('[System.Windows.Forms.MouseButtons]::Left')
+    expect(script).toContain('[System.Windows.Forms.MouseButtons]::Right')
+    expect(script).toContain('function Show-TrayMenu')
+    // Anchored at the cursor like the app: bottom-left on the pointer, growing up
+    // and right (the app's own menu puts its panel bottom-left exactly on the
+    // click point), not parked above the taskbar inside the working area.
+    expect(script).toContain('$menu.Show($cursor.X, $cursor.Y - $script:trayMenu.Height)')
+    // Opening reuses what is already on screen before it opens anything: a browser
+    // window that already shows the page — an installed web app window first, then a
+    // tab window — and only then the web page with this run's token.
+    expect(script).toContain('function Open-DshSurface')
+    expect(script).toContain('function Find-DshWindow')
+    expect(script).toContain("$dshAppProcessName = 'DeepSeek Harness.exe'")
+    expect(script).toContain("$process.CommandLine -match '--app(-id)?='")
+    expect(script).toContain("$dshWindowClass = 'Chrome_WidgetWin_1'")
+    expect(script).toContain('[DshTrayTarget]::FindTitledWindows($dshPageTitleNeedle, $dshWindowClass)')
+    expect(script).toContain('[DshTrayTarget]::Focus')
+    expect(script).toContain('AttachThreadInput')
+    expect(script).toContain('keybd_event(VkMenu, 0, 0, UIntPtr.Zero)')
+    // The Electron desktop app is a different program with its own backend: the tray
+    // must not look it up, launch it, or focus its window.
+    expect(script).not.toContain('com.deepseek.dsh')
+    expect(script).not.toContain('TargetParsingPath')
+    expect(script).not.toContain('shell:AppsFolder')
+    // Both open paths try reuse first (the menu/left click and the second instance).
+    expect(script.split('if (Open-DshSurface) { return }').length - 1).toBe(2)
+    // A reused window is only useful if the instance behind it is up: a page left on an
+    // error page must not become a dead end (the probe is a local request).
+    expect(script).toContain('was not answering behind that window; started DSH through')
+    // WinForms would also open a ContextMenuStrip on a single left click, so the
+    // menu is shown by hand instead of through the NotifyIcon property.
+    expect(script).not.toContain('$tray.ContextMenuStrip')
+    expect(script).not.toContain('Add_DoubleClick')
   })
 
-  it('bakes the tray config and exposes a -Regenerate-only mode', () => {
+  it('drops the watchdog, the idle stop and the switch file entirely', () => {
     const script = trayScript()
-    // Baked values use PowerShell single quotes (JSON escaping is not PS escaping).
-    expect(script).toContain("$shortcutName = 'DeepSeek Harness'")
-    expect(script).toContain("$wslStartScript = '~/.dsh/dsh-web-tray/start.sh'")
-    expect(script).toContain("$wslStopScript = '~/.dsh/dsh-web-tray/stop.sh'")
-    expect(script).toContain('if ($Regenerate) {')
+    for (const gone of [
+      'netstat',
+      'Get-NetTCPConnection',
+      'watchdog',
+      'tray-config.json',
+      'tray-status.json',
+      'Update-Watchdog',
+    ]) {
+      expect(script).not.toContain(gone)
+    }
+    // No awaited wsl.exe call anywhere: waiting for it on the UI thread is what
+    // used to freeze the tray solid. Both the start and the stop path run it
+    // hidden and non-blocking.
+    expect(script).toContain('$shell.Run($wslCmd, 0, $false)')
+    expect(script.split(', 0, $true)')).toHaveLength(1)
+    expect(script).toContain('function Close-Tray([switch]$StopDsh)')
+    expect(script).toContain("Write-TrayLog 'INFO' 'tray exit requested; DSH keeps running'")
+  })
+
+  it('reproduces the desktop app menu, whose colours and metrics were measured', () => {
+    const script = trayScript()
+    // The app's menu is Chromium's, so it cannot be asked for: it is drawn from
+    // the palette and metrics measured off the app's own tray icon.
+    expect(script).toContain('Color.FromArgb(0x1F, 0x1F, 0x1F)') // panel
+    expect(script).toContain('Color.FromArgb(0x36, 0x36, 0x36)') // hovered item
+    expect(script).toContain('Color.FromArgb(0x5E, 0x5E, 0x5E)') // separator
+    expect(script).toContain('Color.FromArgb(0xE3, 0xE3, 0xE3)') // item text
+    expect(script).toContain('DshTrayMenuColors')
+    expect(script).toContain('DshTrayMenuRenderer')
+    // Corners come from the window manager, which anti-aliases them and brings
+    // its own shadow; a Region clip cannot do either.
+    expect(script).toContain('DshTrayCorners')
+    expect(script).toContain('DwmSetWindowAttribute')
+    expect(script).toContain('private const int CornerPreference = 33')
+    // Windows would otherwise draw its 1 px window border around the rounded
+    // popup, which the app's borderless menu does not have.
+    expect(script).toContain('private const int BorderColor = 34')
+    expect(script).toContain('$menu.Add_Opened({ Update-MenuCorners })')
+    for (const gone of ['DshTrayMenuShape', '$cornerRadiusPx', '.Region =']) {
+      expect(script.split(gone)).toHaveLength(1)
+    }
+    // The frame the default renderer draws is what the app does not have, and
+    // the app's separator runs the full panel width where WinForms insets it.
+    expect(script).toContain('protected override void OnRenderToolStripBorder')
+    expect(script).toContain('protected override void OnRenderSeparator')
+    // The app centres item text in its 28 px box, insets it 20 px, and paints it
+    // heavy; the label is drawn here with GDI+ ClearType twice (GDI ClearType is
+    // measurably thinner) and placed by the ink box DshTrayText measures, which is
+    // also what sizes the panel.
+    expect(script).toContain('protected override void OnRenderItemText')
+    expect(script).toContain('TextRenderingHint.ClearTypeGridFit')
+    expect(script).toContain('DshTrayText.InkBox(e.Text, font)')
+    expect(script).toContain('float left = e.Item.Bounds.Left + TextInsetPx - ink.Left')
+    expect(script).toContain('(e.Item.Bounds.Height - ink.Height) / 2f - ink.Top + TextDropPx')
+    // The app's labels sit ~1 px below their box centre, which is what keeps the
+    // space under the last line at 18 px instead of 19-20.
+    expect(script).toContain('$itemTextDropPx = 1')
+    expect(script).toContain('[DshTrayMenuRenderer]::TextDropPx = (Get-Scaled $itemTextDropPx)')
+    // WinForms' own sizing reserves the image margin (214 px of content for a
+    // 175 px label) and the drop-down width varied with it, which left a long
+    // blank strip on the right: the panel is sized from the measured ink instead.
+    expect(script).toContain('$panelWidth = $inkWidth + 2 * $itemInset')
+    expect(script).toContain('$openItem.AutoSize = $false')
+    expect(script).toContain('$menu.AutoSize = $false')
+    expect(script).toContain('$menu.Size = New-Object System.Drawing.Size($panelWidth, $panelHeight)')
+    // Removing the bundle runs no plugin code, so the helper carries the cleanup:
+    // every path it wrote, the shortcut, and any tray started from that directory.
+    expect(script).toContain('[switch]$Uninstall')
+    expect(script).toContain('function Remove-DshArtifacts')
+    expect(script).toContain("Remove-Item -LiteralPath $lnkPath -Force")
+    expect(script).toContain('$wslStartScript -replace \'/[^/]+$\', \'\'')
+    expect(script).toContain('& wsl.exe -d $distro -- bash -lc (\'rm -rf \' + $wslDir)')
+    expect(script).toContain('if ($Uninstall) {')
+    // The app's own font family, not the Windows menu font (YaHei UI 12pt here),
+    // and not a hard-coded Segoe either: the resolved family is the system UI one.
+    expect(script).toContain('$menuFont = [DshTrayFont]::MenuFont(9)')
+    expect(script).toContain('"Microsoft YaHei UI"')
+    expect(script).toContain('"Segoe UI"')
+    // Metrics, in 96-DPI pixels.
+    expect(script).toContain('$panelPaddingPx = 12')
+    expect(script).toContain('$itemHeightPx = 28')
+    expect(script).toContain('$itemTextInsetPx = 20')
+    expect(script).toContain('$separatorGapPx = 17')
+    expect(script).toContain('ShowImageMargin = $false')
+    expect(script).toContain('ShowCheckMargin = $false')
+    expect(script).toContain('$menu.Add_Opened({ Update-MenuCorners })')
+    // DPI awareness and visual styles, or Windows bitmap-scales the menu and
+    // the renderer falls back to system colours (accent-blue hover).
+    expect(script).toContain('[DshTraySetup]::Enable()')
+    expect(script).toContain('SetProcessDPIAware')
+    expect(script).toContain('Application.EnableVisualStyles')
+    // A console-hosted PowerShell owns a console window, and Windows names an
+    // unowned top-level window after its process — that is what listed the menu as
+    // "Windows PowerShell". Tray mode drops the console and the popup is a tool
+    // window, so it never gets a taskbar button or an Alt-Tab entry.
+    expect(script).toContain('[DshTraySetup]::DetachConsole()')
+    expect(script).toContain('FreeConsole')
+    expect(script).toContain('[DshTrayWindow]::MarkToolWindow')
+    expect(script).toContain("$menu.Add_Opening({ try { [DshTrayWindow]::MarkToolWindow($script:trayMenu.Handle) } catch {} })")
+    expect(script).toContain('private const long WsExToolWindow = 0x00000080L')
+    // Detached only in tray mode: the flags that print keep their console.
+    const detachIndex = script.indexOf('[DshTraySetup]::DetachConsole()')
+    expect(script.indexOf("if ($SelfTest)")).toBeLessThan(detachIndex)
+    // No Win32 popup menu any more: the Windows 11 menu (acrylic #2C2C2C, white
+    // text, its own paddings) is a different look from the app's.
+    for (const gone of ['CreatePopupMenu', 'TrackPopupMenuEx']) {
+      expect(script.split(gone)).toHaveLength(1)
+    }
+    // The tray wears the inverted twin of the shortcut icon.
+    expect(script).toContain(`Join-Path $scriptDir '${TRAY_ICON_FILE_NAME}'`)
+    expect(script).toContain('[System.Windows.Forms.SystemInformation]::SmallIconSize')
+    expect(script).toContain("Join-Path $scriptDir 'dsh-web-tray.ico'")
+  })
+
+  it('opens DSH when asked, reusing or starting it, and reports the token URL', () => {
+    const script = trayScript()
+    expect(script).toContain('function Test-DshAlive')
+    expect(script).toContain('Invoke-WebRequest -Uri $webUrl -UseBasicParsing -TimeoutSec $probeTimeoutSec')
+    expect(script).toContain('function Start-OpenFlow')
+    expect(script).toContain('function Invoke-OpenFlowAndWait')
     expect(script).toContain('function Start-DshWsl')
-    expect(script).toContain('重启 DSH 服务')
-    expect(script).toContain('function Restart-Dsh')
-    expect(script).toContain("$shortcut.TargetPath = 'C:\\Windows\\System32\\wscript.exe'")
-    // Stop/start go through stop.sh; the inline pkill (which used to match its
-    // own wsl.exe/bash wrapper) is gone.
-    expect(script).toContain("bash ' + $wslStopScript")
-    expect(script).not.toContain("pkill -f 'apps/cli/lib/bin.js web'")
+    expect(script).toContain("'wsl.exe -d ' + $distro + ' -- bash -lc \"' + $wslStartScript + '\"'")
+    expect(script).toContain('function Get-WebAuthUrl')
+    expect(script).toContain('?token=')
+    expect(script).toContain('wslStartLogUnc')
+    // A fresh tray opens DSH right away: that is what the shortcut is for.
+    expect(script).toContain('Start-OpenFlow')
+    expect(script).toContain('[System.Windows.Forms.Application]::Run()')
+  })
+
+  it('keeps the shortcut plumbing: engine probe, self test and -Regenerate', () => {
+    const script = trayScript()
+    expect(script).toContain('function Test-ScriptEngine([string]$name)')
+    expect(script).toContain("Test-ScriptEngine 'JScript'")
+    expect(script).toContain('function Get-ShortcutTarget')
+    expect(script).toContain("'//E:JScript //B \"' + $launcherPath + '\"'")
+    expect(script).toContain('-WindowStyle Hidden -File')
+    expect(script).toContain('$shortcut.TargetPath = $target.Path')
+    expect(script).toContain("$shortcut.IconLocation = $iconPath + ',0'")
+    // Explorer caches a shortcut's icon by path, so a restyled .ico only shows up
+    // after the shell cache is dropped.
+    expect(script).toContain('function Update-ShellIconCache')
+    expect(script).toContain('SHChangeNotify(0x08000000, 0x1000')
+    expect(script).toContain('Update-ShellIconCache')
+    // The tray helper is exercisable without a UI.
+    expect(script).toContain('[switch]$SelfTest')
+    expect(script).toContain('ConvertTo-Json -Compress -Depth 4')
+    expect(script).toContain('if ($Regenerate) {')
   })
 
   it('escapes single quotes in baked PowerShell values', () => {
-    const script = buildTrayScript({
-      distro: 'Ubuntu',
-      webUrl: 'http://127.0.0.1:3080',
-      shortcutName: "Tray's Harness",
-      wslStartScript: '~/.dsh/dsh-web-tray/start.sh',
-      wslStopScript: '~/.dsh/dsh-web-tray/stop.sh',
-      wslStartLogPath: '/home/me/.dsh/dsh-web-tray/start.log',
-    })
+    const script = buildTrayScript({ ...LAUNCH, shortcutName: "Tray's Harness" })
     // '' doubling is the PowerShell single-quote escape; without it a quote
     // in a value would terminate the baked string.
     expect(script).toContain("$shortcutName = 'Tray''s Harness'")
   })
 
-  it('bakes the runtime config, the idle counter and the status writer', () => {
+  it('carries non-ASCII labels, so the host must write it with a UTF-8 BOM', () => {
     const script = trayScript()
-    // The tuning is only the baked FALLBACK: the helper re-reads
-    // tray-config.json every tick, so a switch change needs no regenerate.
-    expect(script).toContain('$defaultConfigJson = ')
-    expect(script).toContain('"autoStart":true')
-    expect(script).toContain('"autoStopOnExit":true')
-    expect(script).toContain('"autoStopIdleMinutes":0')
-    expect(script).toContain('"watchdogEnabled":true')
-    expect(script).toContain(`$configPath = Join-Path $scriptDir 'tray-config.json'`)
-    expect(script).toContain('function Read-TrayConfig')
-    expect(script).toContain('function Save-TrayConfig')
-    expect(script).toContain("$script:cfgSource = 'last-good'")
-
-    // Liveness probe: HTTP on the web URL with a configurable timeout.
-    expect(script).toContain('Invoke-WebRequest -Uri $webUrl -UseBasicParsing -TimeoutSec $script:cfg.probeTimeoutSec')
-    // State machine + restart trigger.
-    expect(script).toContain('function Update-Watchdog')
-    expect(script).toContain('function Test-DshAlive')
-    expect(script).toContain('function Invoke-WatchdogRestart')
-    expect(script).toContain('function Enter-WatchdogFailure')
-    // Consecutive-failure give-up, and the intentional-stop phase.
-    expect(script).toContain("$script:wd.phase = 'paused'")
-    expect(script).toContain("$script:wd.phase = 'stopped'")
-    expect(script).toContain('$script:wd.stoppedIntentionally')
-
-    // Idle detection: netstat, ESTABLISHED only, with the probe excluded.
-    // Get-NetTCPConnection is deliberately NOT used: it reported zero rows for
-    // the WSL-owned loopback sockets on the machine this fork targets.
-    expect(script).toContain('netstat.exe -ano')
-    // The cmdlet is named in the comment that explains why it is avoided; the
-    // assertion is that it is never CALLED (a call always passes a parameter).
-    expect(script).not.toContain('Get-NetTCPConnection ')
-    expect(script).toContain("$Matches[5] -ne 'ESTABLISHED'")
-    expect(script).toContain('function Get-IdleEstablishedCount')
-    expect(script).toContain('function Update-Idle')
-    expect(script).toContain('idleProbeExcludeProcesses')
-
-    // Status + log files the host card reads.
-    expect(script).toContain(`'${TRAY_LOG_NAME}'`)
-    expect(script).toContain(`'${TRAY_STATUS_NAME}'`)
-    expect(script).toContain('function Write-TrayLog')
-    expect(script).toContain('function Write-TrayStatus')
-    expect(script).toContain('switches = [ordered]@{')
-
-    // Switchable auto start/stop, from the menu and from the card.
-    expect(script).toContain('托盘启动时自动启动 DSH')
-    expect(script).toContain('退出托盘时停止 DSH')
-    expect(script).toContain('守护进程（自动重启）')
-    expect(script).toContain('空闲自动停止')
-    expect(script).toContain('启动 DSH 服务')
-    expect(script).toContain('停止 DSH 服务')
-    expect(script).toContain('重启 DSH 服务')
-    expect(script).toContain('$script:cfg.autoStart')
-    expect(script).toContain('$script:cfg.autoStopOnExit')
-
-    // The launch token is read from the start script's log so the browser does
-    // not land on a 401 page.
-    expect(script).toContain('function Get-WebAuthUrl')
-    expect(script).toContain('function Open-DshPage')
-    expect(script).toContain('?token=')
-    expect(script).toContain('wslStartLogUnc')
-
-    // The real parser is exercisable in isolation.
-    expect(script).toContain('[switch]$SelfTest')
-    expect(script).toContain('[Console]::In.ReadToEnd()')
-  })
-
-  it('bakes a custom config passed by the host as the fallback default', () => {
-    const script = buildTrayScript({
-      distro: 'Ubuntu',
-      webUrl: 'http://127.0.0.1:3080',
-      shortcutName: 'DSH Web',
-      wslStartScript: '~/.dsh/dsh-web-tray/start.sh',
-      wslStopScript: '~/.dsh/dsh-web-tray/stop.sh',
-      wslStartLogPath: '/home/me/.dsh/dsh-web-tray/start.log',
-    }, {
-      ...DEFAULT_TRAY_CONFIG,
-      watchdogEnabled: false,
-      probeIntervalSec: 30,
-      probeTimeoutSec: 5,
-      downThreshold: 5,
-      restartWaitSec: 300,
-      maxRestartFailures: 7,
-      restartBackoffSec: 120,
-      autoStopIdleMinutes: 15,
-    })
-    expect(script).toContain('"watchdogEnabled":false')
-    expect(script).toContain('"probeIntervalSec":30')
-    expect(script).toContain('"probeTimeoutSec":5')
-    expect(script).toContain('"downThreshold":5')
-    expect(script).toContain('"restartWaitSec":300')
-    expect(script).toContain('"maxRestartFailures":7')
-    expect(script).toContain('"restartBackoffSec":120')
-    expect(script).toContain('"autoStopIdleMinutes":15')
+    // Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI: the Chinese menu
+    // labels get mis-decoded, quotes get swallowed and the script fails to
+    // parse. `regenerate()` writes the BOM; this pins down why it must.
+    expect(/[^\u0000-\u007f]/.test(script)).toBe(true)
+    expect(script).toContain('打开 DeepSeek Harness')
   })
 })
 
@@ -254,27 +372,20 @@ describe('source-checkout launches', () => {
     expect(script).toContain('find "$src_dir" -name \'*.ts\' -newer "$SOURCE_CLI"')
   })
 
-  it('only auto-builds a checkout when the caller opts in', () => {
-    expect(startScript(true)).toContain('DSH_WEB_TRAY_AUTO_BUILD')
+  it('never builds a checkout behind the user\'s back', () => {
+    const script = startScript(true)
+    // A missing build output is reported, not silently repaired with a
+    // multi-minute `pnpm run build` inside a launcher: the two mentions are the
+    // WARN and the ERROR line, and both only write to the log.
+    expect(script).not.toContain('AUTO_BUILD')
+    expect(script).not.toContain('auto_build')
+    expect(script.split('pnpm run build').length - 1).toBe(2)
+    expect(script).toContain('log "WARN cli sources are newer than the build output; run \'pnpm run build\' to refresh $SOURCE_CLI"')
+    expect(script).toContain('log "ERROR build the checkout before launching it:')
   })
 
   it('stops a dev instance that was launched from source', () => {
     expect(buildStopScript()).toContain("pkill -f '[s]rc/bin\\.ts web'")
-  })
-
-  it('reports a configured checkout with no build output', () => {
-    const launch: StartCommand = {
-      nodeBin: '/usr/bin/node',
-      sourceCli: null,
-      sourceCwd: '/home/me/deepseek-harness',
-      bakedCli: null,
-      sourceConfigured: true,
-      pathCli: false,
-      sourceBuildState: 'missing',
-    }
-    expect(sourceBuildProblem(launch)).toContain('pnpm run build')
-    expect(sourceBuildProblem({ ...launch, sourceBuildState: 'built' })).toBeNull()
-    expect(sourceBuildProblem({ ...launch, sourceConfigured: false })).toBeNull()
   })
 
   it('rejects a configured project path that does not exist', () => {

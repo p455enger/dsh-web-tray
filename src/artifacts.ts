@@ -1,5 +1,5 @@
 /**
- * Generated artifact text: the WSL-side launcher/stop scripts and the hidden
+ * Generated artifact text: the WSL-side start/stop scripts and the hidden
  * Windows launcher. The tray helper itself lives in tray-script.ts; the names
  * and launch facts are re-exported from names.ts so existing importers keep
  * working.
@@ -7,7 +7,6 @@
 
 export * from './names.ts'
 export { buildTrayScript, wslLogUncPath } from './tray-script.ts'
-export { DEFAULT_TRAY_CONFIG, TRAY_CONFIG_NAME, type TrayConfig } from './config.ts'
 
 import { PLUGIN_ID, TRAY_SCRIPT_NAME, WSL_DIR_NAME } from './names.ts'
 
@@ -95,8 +94,9 @@ source_build_ready() {
   [ -n "$SOURCE_CLI" ] && [ -f "$SOURCE_CLI" ]
 }
 
-# Best-effort freshness check: the cli sources only. A stale build output runs
-# old code, which looks exactly like a code change that did nothing.
+# Freshness check, run once per launch: a stale build output runs old code,
+# which looks exactly like a code change that did nothing. The fix is printed,
+# because this script cannot rebuild the checkout on its own.
 source_build_stale() {
   local src_dir newer
   [ -n "$SOURCE_CLI" ] || return 1
@@ -104,17 +104,6 @@ source_build_stale() {
   [ -d "$src_dir" ] || return 1
   newer="$(find "$src_dir" -name '*.ts' -newer "$SOURCE_CLI" -print -quit 2>/dev/null)"
   [ -n "$newer" ]
-}
-
-# Opt-in: build a checkout whose output is missing. A full build is slow, so it
-# only runs when the caller exported DSH_WEB_TRAY_AUTO_BUILD=1.
-auto_build_source() {
-  local cwd="\${SOURCE_CWD:-}"
-  [ "\${DSH_WEB_TRAY_AUTO_BUILD:-0}" = "1" ] || return 1
-  [ -n "$cwd" ] && [ -d "$cwd" ] || return 1
-  command -v pnpm >/dev/null 2>&1 || return 1
-  log "source build output missing; running 'pnpm run build' in $cwd"
-  (cd "$cwd" && pnpm run build) >>"$LOG_FILE" 2>&1
 }
 
 # Run the checkout's build output in the FOREGROUND of the hidden wsl.exe
@@ -142,9 +131,6 @@ launch_dsh() {
   # build output is acceptable — never src (see above), and never whichever
   # dsh happens to be on PATH, which may be a different version entirely.
   if [ "$SOURCE_CONFIGURED" = "1" ]; then
-    if ! source_build_ready; then
-      auto_build_source || true
-    fi
     if source_build_ready; then
       start_from_source_build
     fi
@@ -179,14 +165,19 @@ launch_dsh
 }
 
 /**
- * Build the WSL-side stop script. The tray runs it through `wsl.exe`; it
- * stops exactly the instance start.sh launched (PID file, written before
- * exec so it tracks the final DSH process), then falls back to a pkill whose
- * bracketed patterns cover every launcher flavor (source build output, npm
- * global, npx all end in `bin.js web`) without matching the wsl.exe/bash
- * wrapper that carries the pattern text in its own command line. A dev
- * instance started from source (`node --import tsx/esm .../src/bin.ts web`) is
- * covered by a second pattern, because "restart DSH" must also replace one.
+ * Build the WSL-side stop script. It is what the tray's exit entry runs: the
+ * generated script stops exactly the instance start.sh launched (PID file,
+ * written before exec so it tracks the final DSH process), then falls back to a
+ * pkill whose bracketed patterns cover every launcher flavor (source build
+ * output, npm global, npx all end in `bin.js web`) without matching the
+ * wsl.exe/bash wrapper that carries the pattern text in its own command line. A
+ * dev instance started from source (`node --import tsx/esm .../src/bin.ts web`)
+ * is covered by a second pattern.
+ *
+ * The PID from the file is checked against /proc before anything is signalled: a
+ * stale PID file plus a reused PID would otherwise kill an unrelated process.
+ * That is the same idea as the port-verified kill a Tauri tray app uses on
+ * Windows (resolve the owner, check what it actually is, then terminate).
  */
 export function buildStopScript(): string {
   return `#!/usr/bin/env bash
@@ -195,10 +186,25 @@ set -u
 
 PID_FILE="$HOME/.dsh/${WSL_DIR_NAME}/dsh.pid"
 
+# Whether a PID is really a DSH web process. A reused PID is not ours to kill.
+is_dsh_web() {
+  local cmdline
+  [ -r "/proc/$1/cmdline" ] || return 1
+  cmdline="$(tr '\\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)"
+  case "$cmdline" in
+    *"bin.js web"*|*"src/bin.ts web"*|*"dsh web"*) return 0 ;;
+  esac
+  return 1
+}
+
 if [ -r "$PID_FILE" ]; then
   pid="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    kill "$pid" 2>/dev/null || true
+    if is_dsh_web "$pid"; then
+      kill "$pid" 2>/dev/null || true
+    else
+      echo "stop.sh: PID $pid from the PID file is not a DSH web process; leaving it alone" >&2
+    fi
   fi
   rm -f "$PID_FILE"
 fi
@@ -210,16 +216,39 @@ exit 0
 }
 
 /**
- * Build the Windows-side hidden launcher for the tray helper. The shortcut
- * points at wscript.exe (a GUI-subsystem host, no console) and passes this
- * script; the script derives the PowerShell path from its own location and
- * starts the tray helper with window style 0.
+ * Build the Windows-side hidden launcher for the tray helper.
+ *
+ * The shortcut runs `wscript.exe //E:JScript //B <this file>`. `wscript.exe` is
+ * a GUI-subsystem host, so no console is ever allocated and the tray appears
+ * without a window; the explicit `//E:JScript` names the engine instead of
+ * letting Windows derive it from the file extension.
+ *
+ * Upstream started a `.vbs` without `//E:`, and that is a real failure mode
+ * now: Windows 11 24H2 ships VBScript as a Feature-on-Demand, and a machine can
+ * end up with `HKCR\.vbs` carrying no ProgID while `vbscript.dll` is still
+ * registered. Windows Script Host then refuses to run the file at all
+ * (没有文件扩展'.vbs'的脚本引擎), the tray never starts, and double-clicking
+ * the shortcut looks like nothing happening. JScript is not part of the
+ * VBScript deprecation, and `//E:` keeps working even when the extension
+ * mapping is gone — `wscript.exe //E:JScript file.txt` runs like `file.js`.
  */
-export function buildTrayVbs(): string {
-  return `' Generated by ${PLUGIN_ID}. Do not edit by hand.
-Set fso = CreateObject("Scripting.FileSystemObject")
-dir = fso.GetParentFolderName(WScript.ScriptFullName)
-Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & dir & "\\${TRAY_SCRIPT_NAME}""", 0, False
+export function buildLauncherScript(): string {
+  return `// Generated by ${PLUGIN_ID}. Do not edit by hand.
+// Started by the desktop shortcut as:
+//   wscript.exe //E:JScript //B "<this file>"
+// wscript.exe keeps the console away; //E:JScript names the script engine, so
+// a machine whose .js/.vbs file association is missing or broken (VBScript is
+// a Feature-on-Demand since Windows 11 24H2) still starts the tray.
+var fso = new ActiveXObject('Scripting.FileSystemObject');
+var dir = fso.GetParentFolderName(WScript.ScriptFullName);
+// Absolute PowerShell: a bare name depends on PATH. Fall back to the name when
+// the expected location is absent.
+var powershell = fso.BuildPath(fso.GetSpecialFolder(1).Path, 'WindowsPowerShell\\\\v1.0\\\\powershell.exe');
+if (!fso.FileExists(powershell)) { powershell = 'powershell.exe'; }
+var tray = fso.BuildPath(dir, '${TRAY_SCRIPT_NAME}');
+var shell = new ActiveXObject('WScript.Shell');
+// Window style 0 and no wait: the tray helper runs hidden and this launcher
+// returns immediately, so a second double-click only hits the tray's mutex.
+shell.Run('"' + powershell + '" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + tray + '"', 0, false);
 `
 }

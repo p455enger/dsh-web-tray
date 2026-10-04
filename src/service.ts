@@ -1,40 +1,40 @@
 /**
- * The WSL desktop/tray launcher service: writes the four generated artifacts
- * (icon, Windows tray helper, WSL start script, WSL stop script) and creates
- * the desktop shortcut through a single PowerShell `-Regenerate` run.
+ * The WSL desktop/tray launcher service: writes the generated artifacts (both
+ * icons, the Windows launcher, the tray helper, the WSL start and stop scripts)
+ * and creates the desktop shortcut through a single PowerShell `-Regenerate`
+ * run.
+ *
+ * Nothing here samples the running DSH: the tray knows whether the URL answers,
+ * the start script writes a PID file, and `stop.sh` stops that PID. A PID/uptime/
+ * RSS poll on every status request was state nobody acted on.
  */
 
-import { chmod, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { existsSync, readFileSync, readdirSync, statSync, type Stats } from 'node:fs'
-import { dirname, join, sep } from 'node:path'
+import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { existsSync, readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import {
   DEFAULT_SHORTCUT_NAME,
   DEFAULT_WEB_URL,
   ICON_FILE_NAME,
+  LAUNCHER_SCRIPT_NAME,
+  LEGACY_CONFIG_NAME,
+  LEGACY_LAUNCHER_NAME,
+  LEGACY_STATUS_NAME,
   START_LOG_NAME,
   START_SCRIPT_NAME,
   STOP_SCRIPT_NAME,
-  TRAY_LOG_NAME,
+  TRAY_ICON_FILE_NAME,
   TRAY_SCRIPT_NAME,
-  TRAY_STATUS_NAME,
-  TRAY_VBS_NAME,
   WIN_DIR_REL,
   WSL_DIR_NAME,
+  buildLauncherScript,
   buildStartScript,
   buildStopScript,
   buildTrayScript,
-  buildTrayVbs,
   type LaunchConfig,
 } from './artifacts.ts'
-import {
-  DEFAULT_TRAY_CONFIG,
-  TRAY_CONFIG_NAME,
-  normalizeTrayConfig,
-  patchTrayConfig,
-  type TrayConfig,
-} from './config.ts'
 import {
   distroName,
   isWsl,
@@ -45,9 +45,6 @@ import {
 
 /** Which deployment this host serves. Windows-native is a later phase. */
 export type TrayPlatform = 'wsl' | 'win' | 'unsupported'
-
-/** Where the switches are stored, as reported to the card. */
-export type ConfigSource = 'file' | 'last-good' | 'defaults'
 
 /** Stable wire shape shared by the status and regenerate routes. */
 export interface TrayStatus {
@@ -65,25 +62,13 @@ export interface TrayStatus {
     shortcutExists: boolean
     trayDir: string | null
     trayScriptExists: boolean
-    trayVbsExists: boolean
+    launcherScriptExists: boolean
     iconExists: boolean
+    trayIconExists: boolean
     startScriptPath: string
     startScriptExists: boolean
     stopScriptExists: boolean
-    configPath: string | null
-    configExists: boolean
   }
-  config: TrayConfig
-  configSource: ConfigSource
-  /** The DSH instance as the host sees it (authoritative pid/uptime). */
-  dsh: {
-    running: boolean
-    pid: number | null
-    uptimeSec: number | null
-    rssMb: number | null
-  }
-  /** The last state the Windows tray wrote, or null before its first tick. */
-  tray: TrayStatusFile | null
   lastError?: string
   lastResult?: string
 }
@@ -92,60 +77,6 @@ export interface TrayStatus {
 export interface WebServerLike {
   readonly host: string
   readonly port: number
-}
-
-/**
- * The state the Windows tray rewrites as tray-status.json on every tick. The
- * host only reads it; the tray owns the state machine and the switch reader.
- */
-export interface TrayStatusFile {
-  updatedAt?: string
-  platform?: string
-  /** starting | probing | restarting | backoff | paused | stopped */
-  phase?: string
-  configSource?: string
-  switches?: {
-    autoStart?: boolean
-    autoStopOnExit?: boolean
-    autoStopIdleMinutes?: number
-    watchdogEnabled?: boolean
-  }
-  probe?: {
-    ok?: boolean
-    detail?: string
-    latencyMs?: number
-    failures?: number
-    downThreshold?: number
-  }
-  restarts?: {
-    count?: number
-    failures?: number
-    maxFailures?: number
-    lastAt?: string | null
-    lastOk?: boolean | null
-  }
-  idle?: {
-    connections?: number | null
-    idleSeconds?: number
-    thresholdMinutes?: number
-    sampledAt?: string | null
-  }
-  dsh?: {
-    running?: boolean
-    lastAliveAt?: string | null
-  }
-  actions?: Array<{
-    at?: string
-    action?: string
-    ok?: boolean
-    detail?: string
-  }>
-  lastError?: string | null
-}
-
-/** Tail of the tray's tray.log. */
-export interface WatchdogLogResult {
-  log: string
 }
 
 /** The context face this service needs. */
@@ -169,12 +100,11 @@ export function webUrlFor(webServer: WebServerLike): string {
   return `http://${host}:${webServer.port}`
 }
 
-/** Locate this package's bundled icon bytes. */
-async function readIconBytes(): Promise<Buffer | null> {
+/** Locate one of this package's bundled icon assets by file name. */
+async function readIconBytes(name: string = ICON_FILE_NAME): Promise<Buffer | null> {
   const here = dirname(fileURLToPath(import.meta.url))
-  const candidate = join(here, '..', 'assets', ICON_FILE_NAME)
   try {
-    return await readFile(candidate)
+    return await readFile(join(here, '..', 'assets', name))
   } catch {
     return null
   }
@@ -183,79 +113,6 @@ async function readIconBytes(): Promise<Buffer | null> {
 /** The WSL-side directory holding the generated start script. */
 export function wslAppDir(): string {
   return join(homedir(), '.dsh', WSL_DIR_NAME)
-}
-
-/** The DSH instance as the host sees it; the tray only knows whether the URL answers. */
-export interface DshProcessInfo {
-  running: boolean
-  pid: number | null
-  uptimeSec: number | null
-  rssMb: number | null
-}
-
-/** Uptime and RSS of one PID, read from /proc (no extra process spawned). */
-function readProcInfo(pid: number): { uptimeSec: number | null; rssMb: number | null } {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
-    // The comm field may contain spaces, so slice past the last ')'.
-    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
-    const startTicks = Number(fields[19])
-    const uptime = Number(readFileSync('/proc/uptime', 'utf8').split(' ')[0])
-    // CLK_TCK is 100 on every platform this plugin supports; hard-coded to
-    // avoid spawning getconf on every status poll.
-    const uptimeSec = Number.isFinite(startTicks) && Number.isFinite(uptime)
-      ? Math.max(0, Math.round(uptime - startTicks / 100))
-      : null
-    let rssMb: number | null = null
-    const status = readFileSync(`/proc/${pid}/status`, 'utf8')
-    const match = /VmRSS:\s+(\d+)\s+kB/.exec(status)
-    if (match !== null) rssMb = Math.round(Number(match[1]) / 1024)
-    return { uptimeSec, rssMb }
-  } catch {
-    return { uptimeSec: null, rssMb: null }
-  }
-}
-
-/**
- * Find the DSH web process: the generated PID file first (written by start.sh
- * before exec, so it tracks the final process), then a /proc scan for a
- * `... web` command line when DSH was started by hand.
- */
-export function findDshProcess(): DshProcessInfo {
-  const candidates: number[] = []
-  try {
-    const pid = Number(readFileSync(join(wslAppDir(), 'dsh.pid'), 'utf8').trim())
-    if (Number.isInteger(pid) && pid > 0) candidates.push(pid)
-  } catch {
-    // No PID file: fall through to the scan.
-  }
-  if (candidates.length === 0) {
-    try {
-      for (const name of readdirSync('/proc')) {
-        if (!/^\d+$/.test(name)) continue
-        try {
-          const cmd = readFileSync(join('/proc', name, 'cmdline'), 'utf8')
-          if (cmd.includes('dsh') && /(?:^|\0)[^\0]*\bweb(?:\0|$)/.test(cmd) && !cmd.includes('dsh-web-tray')) {
-            candidates.push(Number(name))
-          }
-        } catch {
-          // Kernel threads have no cmdline; other users' processes deny it.
-        }
-      }
-    } catch {
-      // /proc itself is unreadable: report not-running below.
-    }
-  }
-  for (const pid of candidates) {
-    try {
-      process.kill(pid, 0)
-    } catch {
-      continue
-    }
-    const { uptimeSec, rssMb } = readProcInfo(pid)
-    return { running: true, pid, uptimeSec, rssMb }
-  }
-  return { running: false, pid: null, uptimeSec: null, rssMb: null }
 }
 
 /**
@@ -277,15 +134,6 @@ export async function readWebAuthUrl(): Promise<string | null> {
   return null
 }
 
-/**
- * How the checkout's build output looks right now.
- *
- * `built` and `stale` both have a runnable `apps/cli/lib/bin.js`; `missing`
- * means the checkout exists but was never built; `none` means no checkout is
- * known at all.
- */
-export type SourceBuildState = 'built' | 'stale' | 'missing' | 'none'
-
 /** The launch facts the generated start script is built from. */
 export interface StartCommand {
   nodeBin: string
@@ -304,8 +152,6 @@ export interface StartCommand {
    * on a plain global install whose argv[1] is the extensionless shim.
    */
   pathCli: boolean
-  /** Whether that checkout currently has a usable build output. */
-  sourceBuildState: SourceBuildState
 }
 
 /** `<checkout>/apps/cli/lib/bin.js`, also accepting a configured `apps/cli` dir. */
@@ -334,51 +180,6 @@ function isSourceEntry(path: string): boolean {
   return /[\\/]apps[\\/]cli[\\/]src[\\/]/.test(path) || /\.(?:ts|tsx|mts|cts)$/.test(path)
 }
 
-/**
- * Newest `.ts` mtime under a directory, or 0 when it cannot be read. The walk
- * is depth-bounded and only ever runs over one small subtree, because it feeds
- * artifact generation and must not become a repository-wide scan.
- */
-function newestSourceMtime(dir: string, depth = 8): number {
-  let newest = 0
-  const walk = (current: string, level: number): void => {
-    if (level > depth) return
-    let names: string[]
-    try {
-      names = readdirSync(current)
-    } catch {
-      return
-    }
-    for (const name of names) {
-      const full = join(current, name)
-      let stats: Stats
-      try {
-        stats = statSync(full)
-      } catch {
-        // A file that vanished mid-walk is not a freshness signal.
-        continue
-      }
-      if (stats.isDirectory()) {
-        walk(full, level + 1)
-      } else if (stats.isFile() && /\.tsx?$/.test(name)) {
-        newest = Math.max(newest, stats.mtimeMs)
-      }
-    }
-  }
-  walk(dir, 0)
-  return newest
-}
-
-/** Classify a build output as current or older than the cli sources. */
-function sourceBuildStateOf(cli: string): SourceBuildState {
-  try {
-    const appDir = dirname(dirname(cli))
-    return newestSourceMtime(join(appDir, 'src')) > statSync(cli).mtimeMs ? 'stale' : 'built'
-  } catch {
-    return 'built'
-  }
-}
-
 /** Whether an executable `dsh` is on PATH (what start.sh tries first). */
 function dshOnPath(): boolean {
   for (const entry of (process.env.PATH ?? '').split(':')) {
@@ -404,6 +205,8 @@ function dshOnPath(): boolean {
  * Only paths that exist NOW are baked in; runtime fallbacks cover later moves.
  * `src` entries (tsx) are never baked in: the runtime resolution mode loads
  * plugins from lib, so a src host mixes two instances of the same packages.
+ * Whether a checkout's build output is CURRENT is not decided here — start.sh
+ * checks that when it launches, and logs the `pnpm run build` reminder.
  */
 function resolveStartCommand(projectPath: string | null | undefined): StartCommand {
   const nodeBin = process.execPath
@@ -420,11 +223,6 @@ function resolveStartCommand(projectPath: string | null | undefined): StartComma
       : existsSync(defaultRoot)
         ? defaultRoot
         : null
-  const sourceBuildState: SourceBuildState = sourceCli !== null
-    ? sourceBuildStateOf(sourceCli)
-    : sourceCwd === null
-      ? 'none'
-      : 'missing'
   const argv1 = process.argv[1]
   let bakedCli: string | null = null
   if (argv1 !== undefined
@@ -441,7 +239,6 @@ function resolveStartCommand(projectPath: string | null | undefined): StartComma
     bakedCli,
     sourceConfigured: configuredExists,
     pathCli: dshOnPath(),
-    sourceBuildState,
   }
 }
 
@@ -453,24 +250,6 @@ export function configuredPathProblem(configuredPath: string): string | null {
   const trimmed = configuredPath.trim()
   if (trimmed === '' || existsSync(trimmed)) return null
   return `the configured project path does not exist: ${trimmed}`
-}
-
-/**
- * The checkout exists but was never built. The generated script is still
- * correct — it refuses to launch src and names the fix — so this is reported
- * as a result, not as a failure to generate.
- */
-export function sourceBuildProblem(launch: StartCommand): string | null {
-  if (!launch.sourceConfigured || launch.sourceBuildState !== 'missing') return null
-  const root = launch.sourceCwd ?? 'the checkout'
-  return `the configured source checkout has no build output (${join(root, 'apps', 'cli', 'lib', 'bin.js')} is missing): run "pnpm run build" in ${root} first — a checkout must launch from its build output, because a src host loads plugin packages from lib and mixes two instances of the same packages`
-}
-
-/** A non-blocking freshness note for the regenerate result, or null. */
-function launchNotice(launch: StartCommand): string | null {
-  return launch.sourceBuildState === 'stale'
-    ? 'the checkout sources are newer than its build output; run "pnpm run build" to refresh it'
-    : null
 }
 
 /**
@@ -518,8 +297,8 @@ export class TrayService {
   }
 
   /**
-   * The Windows-side directory holding the icon, the tray script and the
-   * switches. Resolved once per mount, and authoritatively: with
+   * The Windows-side directory holding the icons, the tray script and the
+   * launcher. Resolved once per mount, and authoritatively: with
    * `appendWindowsPath = false` PATH has no Windows directory, so the scan
    * fallback would pick the wrong user and every write would fail.
    */
@@ -537,82 +316,6 @@ export class TrayService {
     return this.cachedDesktopDir
   }
 
-  /** Windows-side path of tray-config.json, or null when the profile is unknown. */
-  private async configPath(): Promise<string | null> {
-    const trayDir = await this.windowsAppDir()
-    return trayDir === null ? null : join(trayDir, TRAY_CONFIG_NAME)
-  }
-
-  /**
-   * Read the switches in force. The file is written by both the tray menu and
-   * this service, so it is re-read rather than cached; a missing file means the
-   * built-in defaults, an unparsable one reports `last-good` and keeps them.
-   */
-  async readConfigFile(): Promise<{ config: TrayConfig; source: ConfigSource; path: string | null; errors: string[] }> {
-    const path = await this.configPath()
-    if (path === null) return { config: DEFAULT_TRAY_CONFIG, source: 'defaults', path, errors: [] }
-    let raw: string
-    try {
-      raw = await readFile(path, 'utf8')
-    } catch {
-      return { config: DEFAULT_TRAY_CONFIG, source: 'defaults', path, errors: [] }
-    }
-    let parsed: unknown
-    try {
-      parsed = JSON.parse(raw.replace(/^\uFEFF/, ''))
-    } catch (error) {
-      return {
-        config: DEFAULT_TRAY_CONFIG,
-        source: 'last-good',
-        path,
-        errors: [`tray-config.json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`],
-      }
-    }
-    const { config, errors } = normalizeTrayConfig(parsed)
-    return { config, source: 'file', path, errors }
-  }
-
-  /** Apply a partial patch and persist it atomically; returns the config in force. */
-  async writeConfig(patch: unknown): Promise<{ config: TrayConfig; source: ConfigSource; path: string | null; errors: string[] }> {
-    const current = await this.readConfigFile()
-    const { config, errors } = patchTrayConfig(current.config, patch)
-    const path = current.path
-    if (path === null) {
-      return {
-        config,
-        source: current.source,
-        path,
-        errors: [...errors, 'cannot determine the Windows user profile, so the switches were not saved'],
-      }
-    }
-    try {
-      await mkdir(dirname(path), { recursive: true })
-      const temporary = `${path}.tmp`
-      await writeFile(temporary, JSON.stringify(config, null, 2), 'utf8')
-      await rename(temporary, path)
-    } catch (error) {
-      return {
-        config,
-        source: current.source,
-        path,
-        errors: [...errors, `could not write tray-config.json: ${error instanceof Error ? error.message : String(error)}`],
-      }
-    }
-    return { config, source: 'file', path, errors }
-  }
-
-  /** Write the defaults when the file is absent, so the tray and the card agree. */
-  async ensureConfig(): Promise<void> {
-    const path = await this.configPath()
-    if (path === null || existsSync(path)) return
-    try {
-      await mkdir(dirname(path), { recursive: true })
-      await writeFile(path, JSON.stringify(DEFAULT_TRAY_CONFIG, null, 2), 'utf8')
-    } catch {
-      // The tray falls back to its baked defaults, so this is not fatal.
-    }
-  }
-
   /** Read the current on-disk facts. */
   async status(): Promise<TrayStatus> {
     const platform: TrayPlatform = isWsl() ? 'wsl' : 'unsupported'
@@ -622,7 +325,6 @@ export class TrayService {
     const startScriptPath = join(wslAppDir(), START_SCRIPT_NAME)
     const stopScriptPath = join(wslAppDir(), STOP_SCRIPT_NAME)
     const shortcutPath = desktopDir === null ? null : join(desktopDir, `${this.shortcutName}.lnk`)
-    const configInfo = await this.readConfigFile()
     return {
       ok: true,
       platform,
@@ -637,60 +339,25 @@ export class TrayService {
         shortcutExists: shortcutPath !== null && existsSync(shortcutPath),
         trayDir,
         trayScriptExists: trayDir !== null && existsSync(join(trayDir, TRAY_SCRIPT_NAME)),
-        trayVbsExists: trayDir !== null && existsSync(join(trayDir, TRAY_VBS_NAME)),
+        launcherScriptExists: trayDir !== null && existsSync(join(trayDir, LAUNCHER_SCRIPT_NAME)),
         iconExists: trayDir !== null && existsSync(join(trayDir, ICON_FILE_NAME)),
+        trayIconExists: trayDir !== null && existsSync(join(trayDir, TRAY_ICON_FILE_NAME)),
         startScriptPath,
         startScriptExists: existsSync(startScriptPath),
         stopScriptExists: existsSync(stopScriptPath),
-        configPath: configInfo.path,
-        configExists: configInfo.path !== null && existsSync(configInfo.path),
       },
-      config: configInfo.config,
-      configSource: configInfo.source,
-      dsh: findDshProcess(),
-      tray: await this.trayStatus(),
-    }
-  }
-
-  /** Read the last state the Windows tray wrote (null before its first tick). */
-  async trayStatus(): Promise<TrayStatusFile | null> {
-    const trayDir = await this.windowsAppDir()
-    if (trayDir === null) return null
-    try {
-      const raw = await readFile(join(trayDir, TRAY_STATUS_NAME), 'utf8')
-      const parsed: unknown = JSON.parse(raw.replace(/^\uFEFF/, ''))
-      return parsed !== null && typeof parsed === 'object' ? parsed as TrayStatusFile : null
-    } catch {
-      return null
-    }
-  }
-
-  /** Return the last `maxLines` lines of the tray's watchdog log ('' when absent). */
-  async watchdogLog(maxLines = 200): Promise<WatchdogLogResult> {
-    const trayDir = await this.windowsAppDir()
-    if (trayDir === null) return { log: '' }
-    try {
-      const raw = await readFile(join(trayDir, TRAY_LOG_NAME), 'utf8')
-      const text = raw.replace(/^\uFEFF/, '')
-      const lines = text.split(/\r?\n/).filter(line => line !== '')
-      const capped = Math.max(1, Math.min(Math.floor(maxLines), 2000))
-      return { log: lines.slice(-capped).join('\n') }
-    } catch {
-      return { log: '' }
     }
   }
 
   /**
-   * Build the text artifacts for the current host facts, plus the launch plan
-   * they were derived from. Null when no launcher can be located at all
-   * (regenerate reports that as an error).
+   * Build the text artifacts for the current host facts. Null when no launcher
+   * can be located at all (regenerate reports that as an error).
    */
   private currentScripts(): {
     startScript: string
     stopScript: string
     trayScript: string
-    trayVbs: string
-    launch: StartCommand
+    launcher: string
   } | null {
     const cli = resolveStartCommand(this.projectPath)
     // A configured checkout with no build output still gets a script: it
@@ -715,24 +382,24 @@ export class TrayService {
         webUrl: config.webUrl,
       }),
       stopScript: buildStopScript(),
-      trayScript: buildTrayScript(config, DEFAULT_TRAY_CONFIG),
-      trayVbs: buildTrayVbs(),
-      launch: cli,
+      trayScript: buildTrayScript(config),
+      launcher: buildLauncherScript(),
     }
   }
 
   /**
-   * Ensure the five generated files exist AND match the current host facts
-   * (web URL, CLI path, shortcut name). A stale start script from another
-   * port/profile is a real failure mode, so compare content, not presence.
+   * Ensure the six generated files exist AND match the current host facts
+   * (web URL, CLI path, shortcut name, icon art). A stale start script from
+   * another port/profile — or an icon from an older release — is a real failure
+   * mode, so compare content, not presence.
    */
   async ensure(): Promise<TrayStatus> {
     const base = await this.status()
-    await this.ensureConfig()
     const filesExist = base.files.shortcutExists
       && base.files.trayScriptExists
-      && base.files.trayVbsExists
+      && base.files.launcherScriptExists
       && base.files.iconExists
+      && base.files.trayIconExists
       && base.files.startScriptExists
     if (!filesExist) return this.regenerate()
     const current = this.currentScripts()
@@ -748,9 +415,19 @@ export class TrayService {
         // The file is written with a UTF-8 BOM for Windows PowerShell 5.1.
         const trayMatches = await readFile(trayPath, 'utf8').then(text => text.replace(/^\uFEFF/, '') === current.trayScript)
         if (!trayMatches) return this.regenerate()
-        const vbsPath = join(base.files.trayDir, TRAY_VBS_NAME)
-        const vbsMatches = await readFile(vbsPath, 'utf8') === current.trayVbs
-        if (!vbsMatches) return this.regenerate()
+        const launcherPath = join(base.files.trayDir, LAUNCHER_SCRIPT_NAME)
+        const launcherMatches = await readFile(launcherPath, 'utf8') === current.launcher
+        if (!launcherMatches) return this.regenerate()
+        // Bytes, not presence: restyled icons have to reach an existing install,
+        // and the shortcut Explorer caches is what the user sees.
+        for (const name of [ICON_FILE_NAME, TRAY_ICON_FILE_NAME]) {
+          const expected = await readIconBytes(name)
+          const matches = expected !== null
+            && await readFile(join(base.files.trayDir, name))
+              .then(bytes => bytes.equals(expected))
+              .catch(() => false)
+          if (!matches) return this.regenerate()
+        }
       }
       return base
     } catch {
@@ -780,13 +457,17 @@ export class TrayService {
     if (pathProblem !== null) {
       return { ...base, ok: false, lastError: pathProblem }
     }
-    const icon = await readIconBytes()
-    if (icon === null) {
-      return {
-        ...base,
-        ok: false,
-        lastError: 'the bundled dsh-web-tray.ico asset is missing from the installed package',
+    const icons: Array<[string, Buffer]> = []
+    for (const name of [ICON_FILE_NAME, TRAY_ICON_FILE_NAME]) {
+      const bytes = await readIconBytes(name)
+      if (bytes === null) {
+        return {
+          ...base,
+          ok: false,
+          lastError: `the bundled ${name} asset is missing from the installed package`,
+        }
       }
+      icons.push([name, bytes])
     }
 
     const wslStartDir = wslAppDir()
@@ -802,11 +483,21 @@ export class TrayService {
     try {
       await mkdir(trayDir, { recursive: true })
       await mkdir(wslStartDir, { recursive: true })
-      // Write the stop script FIRST: the tray helper it is about to (re)create
-      // and the watchdog both stop DSH through it.
-      await writeFile(join(trayDir, ICON_FILE_NAME), icon)
+      for (const [name, bytes] of icons) {
+        await writeFile(join(trayDir, name), bytes)
+      }
+      // The BOM is required: without it Windows PowerShell 5.1 reads the
+      // Chinese menu labels as ANSI and the script fails to parse.
       await writeFile(join(trayDir, TRAY_SCRIPT_NAME), '\uFEFF' + scripts.trayScript, 'utf8')
-      await writeFile(join(trayDir, TRAY_VBS_NAME), scripts.trayVbs, 'utf8')
+      // Plain ASCII, no BOM: Windows Script Host reads a .js launcher as ANSI,
+      // and a BOM would be a syntax error for it.
+      await writeFile(join(trayDir, LAUNCHER_SCRIPT_NAME), scripts.launcher, 'utf8')
+      // An install from before the JScript launcher keeps a .vbs that the
+      // shortcut no longer points at, and one from before the simplification
+      // keeps a switch and a status file nothing reads any more.
+      for (const legacy of [LEGACY_LAUNCHER_NAME, LEGACY_CONFIG_NAME, LEGACY_STATUS_NAME]) {
+        await rm(join(trayDir, legacy), { force: true })
+      }
       await writeFile(join(wslStartDir, START_SCRIPT_NAME), scripts.startScript, 'utf8')
       await chmod(join(wslStartDir, START_SCRIPT_NAME), 0o755)
       await writeFile(join(wslStartDir, STOP_SCRIPT_NAME), scripts.stopScript, 'utf8')
@@ -824,16 +515,7 @@ export class TrayService {
         }
       }
       const refreshed = await this.status()
-      // The script is correct and self-healing, so a missing build output is
-      // reported as an actionable result rather than as a write failure.
-      const buildProblem = sourceBuildProblem(scripts.launch)
-      if (buildProblem !== null) {
-        return { ...refreshed, ok: false, lastError: buildProblem }
-      }
-      const notice = launchNotice(scripts.launch)
-      const lastResult = [result.stdout.trim() || (refreshed.files.shortcutPath ?? 'shortcut created'), notice]
-        .filter(part => part !== null && part !== '')
-        .join('; ')
+      const lastResult = result.stdout.trim() || refreshed.files.shortcutPath || 'shortcut created'
       return { ...refreshed, ok: refreshed.files.shortcutExists, lastResult }
     } catch (error) {
       this.ctx.logger?.warn(`[dsh-web-tray] regenerate failed: ${error instanceof Error ? error.message : String(error)}`)

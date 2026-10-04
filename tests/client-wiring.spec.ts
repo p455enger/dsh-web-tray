@@ -59,10 +59,12 @@ describe('client section wiring', () => {
     expect(html).toContain('description')
     expect(html).toContain('projectPath')
     expect(html).toContain('regenerate')
-    // The switches and the live status groups render from the same component.
-    expect(html).toContain('switchesTitle')
-    expect(html).toContain('swAutoStart')
+    // The runtime facts, the generated files and the tray hint all render from
+    // one component; the switches, the watchdog and the log viewer are gone.
     expect(html).toContain('statusTitle')
-    expect(html).toContain('wdLogAuto')
+    expect(html).toContain('filesTitle')
+    expect(html).toContain('trayHint')
+    expect(html).not.toContain('switchesTitle')
+    expect(html).not.toContain('wdLog')
   })
 })
