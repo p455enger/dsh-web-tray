@@ -1,7 +1,7 @@
 {
   "name": "dsh-web-tray",
   "description": "DSH plugin: Windows tray icon and desktop shortcut for dsh web running inside WSL — open and exit only, no watchdog, no configuration or status files (fork of dsh-wsl-tray)",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
