@@ -4,9 +4,11 @@
  * here. Windows is injected (a fake PowerShell runner and a fake environment), which is what
  * makes these hermetic.
  */
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   OWNED_FILES,
@@ -171,6 +173,23 @@ describe('command line', () => {
     expect(() => parseArgs(['install', '--port'])).toThrow(/needs a value/)
     expect(() => parseArgs(['install', '--port', '0'])).toThrow(/1-65535/)
     expect(() => parseArgs(['install', '--port', '65536'])).toThrow(/1-65535/)
+  })
+})
+
+describe('the entry point', () => {
+  it('runs when it is reached through a symlink, the way npm\'s bin shim does', () => {
+    // `npm i -g` and `npx` both run the package through a symlink in `.bin`, so
+    // argv[1] is the link while import.meta.url is the real file. Comparing those
+    // directly made every shimmed run exit 0 without a word.
+    const link = join(tmp, 'bin-shim-dsh-web-tray')
+    symlinkSync(fileURLToPath(new URL('../bin/dsh-web-tray.mjs', import.meta.url)), link)
+    // No verb: the CLI prints its usage.
+    const noVerb = spawnSync(process.execPath, [link], { encoding: 'utf8' })
+    expect(noVerb.stdout).toContain('Usage: dsh-web-tray')
+    // And the real path is still found, so PACKAGE_ROOT and the windows/ directory resolve.
+    const version = spawnSync(process.execPath, [link, '--version'], { encoding: 'utf8' })
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }
+    expect(version.stdout.trim()).toBe(pkg.version)
   })
 })
 

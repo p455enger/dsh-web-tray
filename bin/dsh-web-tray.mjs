@@ -15,7 +15,7 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from 'node:fs'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve, sep } from 'node:path'
@@ -634,18 +634,21 @@ export function parseArgs(argv) {
 export async function main(argv, io = {}) {
   const log = io.log ?? console.log
   const options = parseArgs(argv)
-  if (options.help || options.verb === '') { log(HELP); return 0 }
+  if (options.help) { log(HELP); return 0 }
+  // Before the empty-verb shortcut: `-v` is advertised in the help text, and the
+  // shortcut used to answer `--version` with the help instead of the version.
+  if (options.version) {
+    const pkg = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf8'))
+    log(pkg.version)
+    return 0
+  }
+  if (options.verb === '') { log(HELP); return 0 }
   if (options.verb !== 'install') {
     // These describe what install writes; silently ignoring them would let a user believe a
     // status or open call had changed the configuration.
     for (const [flag, value] of [['--distro', options.distro], ['--workspace', options.workspace], ['--command', options.command], ['--port', options.port]]) {
       if (value !== undefined) throw new Error(`${flag} is only meaningful for install`)
     }
-  }
-  if (options.version) {
-    const pkg = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf8'))
-    log(pkg.version)
-    return 0
   }
   if (options.verb === 'install') {
     const result = await install({ ...options, log })
@@ -661,7 +664,26 @@ export async function main(argv, io = {}) {
   return 1
 }
 
-if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+/**
+ * Whether this module is the process entry point.
+ *
+ * npm's `bin` shim — and therefore every `npx dsh-web-tray` run — is a symlink on
+ * Linux, so `argv[1]` names the link while `import.meta.url` is the real file.
+ * Comparing those two resolves directly told the CLI it had been imported, and it
+ * exited 0 without printing anything: `npx dsh-web-tray install` did nothing at
+ * all. Resolve both sides instead.
+ */
+function isEntryPoint(argv1 = process.argv[1]) {
+  if (argv1 === undefined) return false
+  const self = fileURLToPath(import.meta.url)
+  try {
+    return realpathSync(argv1) === realpathSync(self)
+  } catch {
+    return resolve(argv1) === resolve(self)
+  }
+}
+
+if (isEntryPoint()) {
   main(process.argv.slice(2)).then(
     code => { process.exitCode = code },
     error => {
