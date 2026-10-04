@@ -15,12 +15,11 @@ import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import {
-  ICON_FILE_NAME,
-  TRAY_ICON_BLACK_NAME,
-  TRAY_ICON_FILE_NAMES,
-  TRAY_ICON_WHITE_NAME,
-} from '../src/names.ts'
+/** The bundled asset names: the installer copies these and the tray script loads them. */
+const ICON_FILE_NAME = 'dsh-web-tray.ico'
+const TRAY_ICON_BLACK_NAME = 'dsh-web-tray-black.ico'
+const TRAY_ICON_WHITE_NAME = 'dsh-web-tray-white.ico'
+const TRAY_ICON_FILE_NAMES = [TRAY_ICON_BLACK_NAME, TRAY_ICON_WHITE_NAME]
 
 const ASSETS = join(dirname(fileURLToPath(import.meta.url)), '..', 'assets')
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
@@ -107,8 +106,13 @@ function frameOf(icon: IconAsset, size: number): Frame {
   return frame
 }
 
-describe('bundled icons', () => {
-  it('ships every shortcut size the shell asks for, smallest first', () => {
+/** The favicon's own ink box is 48.3 x 36.3 units: a whale, never a square. */
+function expectWhaleAspect(box: { width: number; height: number }): void {
+  expect(box.height / box.width).toBeGreaterThan(0.70)
+  expect(box.height / box.width).toBeLessThan(0.82)
+}
+
+describe('bundled icons', () => {  it('ships every shortcut size the shell asks for, smallest first', () => {
     const icon = load(ICON_FILE_NAME)
     expect(icon.frames.map(frame => frame.size)).toEqual([16, 20, 24, 32, 40, 48, 64, 96, 128, 256])
   })
@@ -130,22 +134,21 @@ describe('bundled icons', () => {
     ])
   })
 
-  it('draws a dark whale on a light rounded tile for the shortcut', () => {
+  it('is the page favicon itself: the mark on transparency, with no tile', () => {
+    // What a Chromium "install as app" shortcut carries: the favicon, not a composited tile.
     const icon = load(ICON_FILE_NAME)
-    const frame = icon.frames.find(entry => entry.size === 48)
-    expect(frame).toBeDefined()
-    if (frame === undefined) return
-    // Rounded corner and tile inset: the outermost pixels are transparent.
-    expect(icon.pixel(frame, 0, 0)[3]).toBe(0)
-    expect(icon.pixel(frame, 0, 24)[3]).toBe(0)
-    // Tile in front of the whale's head: light and opaque.
-    const tile = icon.pixel(frame, 24, 4)
-    expect(tile[3]).toBeGreaterThan(240)
-    expect(luminance(tile)).toBeGreaterThan(220)
-    // Whale body at the centre: dark and opaque.
-    const whale = icon.pixel(frame, 24, 22)
-    expect(whale[3]).toBe(255)
-    expect(luminance(whale)).toBeLessThan(90)
+    const frame = frameOf(icon, 48)
+    for (const corner of [[0, 0], [47, 0], [0, 47], [47, 47]]) {
+      expect(icon.pixel(frame, corner[0] as number, corner[1] as number)[3]).toBe(0)
+    }
+    // The mark fills the frame the way a favicon does, and it is a whale, not a square.
+    const box = inkBox(icon, frame)
+    expect(box.width).toBeGreaterThanOrEqual(Math.round(frame.size * 0.95))
+    expectWhaleAspect(box)
+    // The dark ink the page's own favicon draws, opaque at the body.
+    const body = icon.pixel(frame, 24, 24)
+    expect(body[3]).toBe(255)
+    expect(luminance(body)).toBeLessThan(90)
   })
 
   it('ships the favicon mark in both tray inks, BMP only, at the tray frame sizes', () => {
@@ -170,8 +173,7 @@ describe('bundled icons', () => {
         expect(box.width).toBeGreaterThanOrEqual(expected - 1)
         expect(box.width).toBeLessThanOrEqual(expected)
         // The favicon's own ink box is 48.3 x 36.3 units: a whale, not a square.
-        expect(box.height / box.width).toBeGreaterThan(0.70)
-        expect(box.height / box.width).toBeLessThan(0.82)
+        expectWhaleAspect(box)
       }
     }
     // No tile: the corners are transparent and only the mark carries alpha, which
