@@ -1,5 +1,5 @@
 /**
- * The WSL desktop/tray launcher service: writes the generated artifacts (both
+ * The WSL desktop/tray launcher service: writes the generated artifacts (three
  * icons, the Windows launcher, the tray helper, the WSL start and stop scripts)
  * and creates the desktop shortcut through a single PowerShell `-Regenerate`
  * run.
@@ -8,6 +8,7 @@
  * the start script writes a PID file, and `stop.sh` stops that PID. A PID/uptime/
  * RSS poll on every status request was state nobody acted on.
  */
+import { type TrayHostBridge } from './windows.ts';
 /** Which deployment this host serves. Windows-native is a later phase. */
 export type TrayPlatform = 'wsl' | 'win' | 'unsupported';
 /** Stable wire shape shared by the status and regenerate routes. */
@@ -52,14 +53,17 @@ export interface TrayServiceContext {
 export declare function wslPathToWindowsPath(path: string): string;
 /** The DSH web URL for a bound webserver host/port. */
 export declare function webUrlFor(webServer: WebServerLike): string;
-/** The WSL-side directory holding the generated start script. */
-export declare function wslAppDir(): string;
+/**
+ * The WSL-side directory holding the generated start script.
+ * @param home - the user's home directory; the service passes the bridge's own.
+ */
+export declare function wslAppDir(home?: string): string;
 /**
  * The token URL of the current DSH run, from the start script's log. The token
  * is per-process, so only the newest line counts; without it the browser lands
  * on a 401 page.
  */
-export declare function readWebAuthUrl(): Promise<string | null>;
+export declare function readWebAuthUrl(appDir?: string): Promise<string | null>;
 /** The launch facts the generated start script is built from. */
 export interface StartCommand {
     nodeBin: string;
@@ -92,10 +96,15 @@ export declare class TrayService {
     private readonly ctx;
     private readonly webServer;
     private readonly shortcutName;
+    private readonly bridge;
     private cachedDesktopDir;
     private cachedWindowsDir;
+    private cachedProfileDir;
+    private regenerating;
     private projectPath;
-    constructor(ctx: TrayServiceContext, webServer: WebServerLike, shortcutName?: string);
+    constructor(ctx: TrayServiceContext, webServer: WebServerLike, shortcutName?: string, bridge?: TrayHostBridge);
+    /** The WSL-side directory this service owns, under the bridge's home. */
+    private appDir;
     /** Read the persisted source-project path, defaulting to empty (auto-detect). */
     private readProjectPathFromDisk;
     /** The currently configured source-project path (empty = auto-detect). */
@@ -109,6 +118,11 @@ export declare class TrayService {
      * fallback would pick the wrong user and every write would fail.
      */
     private windowsAppDir;
+    /**
+     * The Windows user profile, resolved once per mount: the PowerShell fallback costs
+     * seconds, and `/status` is fetched by the settings card.
+     */
+    private windowsProfileDir;
     /** Resolve the desktop once per mount; PowerShell is authoritative. */
     desktopDir(): Promise<string | null>;
     /** Read the current on-disk facts. */
@@ -125,6 +139,12 @@ export declare class TrayService {
      * mode, so compare content, not presence.
      */
     ensure(): Promise<TrayStatus>;
-    /** Write all artifacts and create/refresh the desktop shortcut. */
+    /**
+     * Write all artifacts and create/refresh the desktop shortcut.
+     *
+     * Single-flight: two mounts, or a mount racing the settings card's button, must not
+     * write the same files (and the same `.lnk`) at the same time.
+     */
     regenerate(): Promise<TrayStatus>;
+    private regenerateOnce;
 }

@@ -38,8 +38,24 @@ DSH）。没有守护进程、没有空闲自动停止、没有配置文件、�
 - **移除两个状态文件**：`tray-config.json`、`tray-status.json` —— 重新生成产物时会一并删除。
 - **更换启动器**：桌面快捷方式从 `.vbs` 改为 `wscript.exe //E:JScript //B dsh-web-tray.js`
   （Windows 11 24H2 起 VBScript 是按需功能），旧的 `.vbs` 会被删掉。
-- **托盘图标换成反色版**（`dsh-web-tray-inverted.ico`），与桌面应用自带的托盘图标区分。
+- **托盘图标换过两次** —— 0.2.0 是反色底板，0.3.0 起是随任务栏主题取黑 / 白的 favicon 鲸鱼
+  （见下一节）。
 - 升级后**重新生成一次产物**即可：挂载插件时会自动做，或在设置卡片点「重建桌面快捷方式」。
+
+## 从 0.2.0 升级
+
+0.3.0 修掉 0.2.0 Windows 侧的问题，另有两处看得见的变化：
+
+- **托盘图标**：反色底板换成页面 favicon 上的鲸鱼 —— 去掉底板的纯鲸鱼，尺寸与桌面应用自带的
+  托盘图标一致，按**任务栏主题取黑或白**（每 5 s 读一次注册表）。`dsh-web-tray-inverted.ico`
+  会被删除。
+- **新增快捷方式戳**：`tray-shortcut.json` 记下快捷方式应有的样子 —— 目标、参数、图标，以及
+  `.lnk` 自身的大小与摘要。被替换、从备份还原或被手工改过的快捷方式现在会被重建，而不是
+  只要存在就被信任。
+- **0.2.0 评审的修复**：烘进生成脚本的每个值都做了 shell 引号处理；`-Uninstall` 覆盖旧版本
+  留下的文件；未捕获的错误会在 `tray.log` 里留一行而不是静默失败；产物原子写入、`regenerate()`
+  单飞；`ensure()` 能发现遗留文件；`pkill` 兜底也覆盖全局安装的 `dsh`。无需手动步骤：挂载即
+  重新生成。
 
 ## 环境要求
 
@@ -66,12 +82,13 @@ PY
 mkdir -p "$P/node_modules" && ln -sfn /path/to/dsh-web-tray "$P/node_modules/dsh-web-tray"
 
 # C. 打包成 tarball
-npm pack && dsh plugin --profile web add ./dsh-web-tray-0.2.0.tgz
+npm pack && dsh plugin --profile web add ./dsh-web-tray-0.3.0.tgz
 ```
 
 三种方式都需要**重启 `dsh web`**。首次挂载时 `ensure()` 会写出全部产物并创建桌面快捷方式。
-安装与重新生成都是幂等的：每次写出的字节完全相同（只有 `tray.log` 会增长，这是设计如此），
-重复挂载也不会起第二个托盘。
+安装与重新生成都是幂等的：`ensure()` 会比对各产物、旧版本残留的文件以及快捷方式自己的戳，
+一致时什么都不重写、不起第二个托盘、也不跑 PowerShell —— 日常使用中只有 `tray.log` 和
+`start.log` 会增长。
 
 ## 卸载
 
@@ -88,7 +105,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\dsh-w
 dsh plugin --profile web remove dsh-web-tray
 ```
 
-`-Uninstall` 会先停掉从该目录启动的托盘，然后删除桌面快捷方式、助手脚本、启动器、两个图标、
+`-Uninstall` 会先停掉从该目录启动的托盘，然后删除桌面快捷方式、助手脚本、启动器、三个图标、
 `tray.log`、`tray-selftest.json`，以及 WSL 侧目录（`start.sh`、`stop.sh`、`start.log`、
 `dsh.pid`、`project-path.json`）。DSH 本身会继续运行；重复执行也无副作用。若不执行它，
 上述文件会全部留在机器上 —— 而且仍然可用，因为快捷方式和生成的脚本都是自包含的。
@@ -103,13 +120,18 @@ dsh plugin --profile web remove dsh-web-tray
 | 文件 | 位置 |
 | --- | --- |
 | `dsh-web-tray.ps1`（托盘助手）、`dsh-web-tray.js`（隐藏启动器） | `%USERPROFILE%\.dsh\dsh-web-tray\` |
-| `dsh-web-tray.ico`（快捷方式图标）、`dsh-web-tray-inverted.ico`（托盘图标） | 同上 |
+| `dsh-web-tray.ico`（快捷方式图标）、`dsh-web-tray-black.ico` / `dsh-web-tray-white.ico`（托盘图标，黑 / 白对应任务栏主题） | 同上 |
 | `tray.log`（每次打开/退出/报错一行，不轮转） | 同上 |
+| `tray-shortcut.json`（快捷方式应有的样子：目标、参数、图标、`.lnk` 摘要） | 同上 |
 | `start.sh`、`stop.sh`、`start.log`、`dsh.pid` | `~/.dsh/dsh-web-tray/` |
 | `project-path.json`（仅在保存过项目路径时存在） | `~/.dsh/dsh-web-tray/` |
 | `DSH Web.lnk`（目标为 `wscript.exe //E:JScript //B …dsh-web-tray.js`） | Windows 桌面 |
 
 运行 `dsh-web-tray.ps1 -SelfTest` 会在助手旁边写出 `tray-selftest.json`（菜单契约，UTF-8）。
+
+`~/.dsh/dsh-web-tray.env`（可选，`chmod 600`，每行一个 `KEY=VALUE`）会被 `start.sh` 读取并
+导出到 DSH 进程环境里 —— 比如 MCP 服务器要的 token。脚本只负责读，不会创建它；更早的个人命名
+`~/.dsh/github-mcp-token` 仍然生效。
 
 ## 工作原理
 
@@ -145,8 +167,9 @@ dsh plugin --profile web remove dsh-web-tray
   候选**：它是另一套程序、自带后端，其窗口按进程名被显式跳过。`-SelfTest` 会报告找到了什么、以及
   因这个原因跳过了几个窗口（`dshWindow`、`dshWindowIsWebApp`、`dshWindowsSkippedAsApp`、
   `focusReturned`）。
-- **不做后台采样**：没有 `netstat`、没有轮询循环、没有状态文件、不扫 `/proc`。
-  只有被要求打开时，UI 线程才探测一次（≤ 2 s）。
+- **不做后台采样**：没有 `netstat`、没有状态文件、不扫 `/proc`。只有被要求打开时，UI 线程才
+  探测一次（≤ 2 s）；打开流程里那个 2 s 定时器只在它自己拉起的 DSH 启动期间轮询，最多 120 s。
+  除此之外唯一的后台动作是每 5 s 读一次注册表取任务栏主题。
 - **单实例**：`Local\dsh-web-tray-single` 互斥体。托盘在跑时再次双击不会起第二个托盘，
   那个进程只是打开 DSH。
 
@@ -161,8 +184,9 @@ dsh plugin --profile web remove dsh-web-tray
 ## 平台适配
 
 1. **PATH 里没有 `powershell.exe`**（`.wslconfig` 设了 `appendWindowsPath = false`）→
-   创建快捷方式、解析桌面路径和用户目录全部失败。现在先查 PATH，再退回
-   `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`。
+   创建快捷方式、解析桌面路径和用户目录全部失败。现在先按盘符探测
+   `/mnt/<盘符>/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`，裸名字放到最后：
+   PATH 里带 Windows 目录的机器照常可用，Windows 装在别的盘上也不会再退回失败。
 2. **用户目录解析成了 `Administrator`**（`/mnt/c/Users` 里按字母序的第一个，不可写）→
    改为先问 PowerShell 要 `[Environment]::GetFolderPath('UserProfile')`，扫目录只作兜底。
 3. **用 npm 全局装的 `dsh` 被启动器判定拒绝**，导致什么都不生成 → 现在 PATH 上的 `dsh`
@@ -171,8 +195,14 @@ dsh plugin --profile web remove dsh-web-tray
    按需功能。启动器改为 JScript，用 `wscript.exe //E:JScript //B …` 显式指定引擎；
    写快捷方式时会探测引擎，只有在 JScript 也缺失时才退回隐藏的 `powershell.exe`，
    重新生成时会删掉旧的 `.vbs`。
-5. **图标**：快捷方式用 DSH 应用风格（浅色圆角底、深色鲸鱼，16–256），托盘图标是它的反色
-   孪生（深底、浅色鲸鱼，16–64），两者可区分。写快捷方式时会用
+5. **宿主拉起的 PowerShell 里缺 cmdlet**：本机同时装了 PowerShell 7，而从 WSL 启动的 Windows
+   进程继承的是**用户**环境，于是 5.1 拿到一个以 7 的模块目录开头的模块路径：`Get-FileHash`
+   报「无法识别」、其模块却显示已加载，快捷方式戳因此从未写出，每次挂载都整份重新生成。
+   现在助手自己把 `PSModulePath` 指到 `$PSHOME\Modules`，并用 .NET 计算 `.lnk` 摘要。
+6. **图标**：快捷方式用 DSH 应用风格（浅色圆角底、深色鲸鱼，16–256）。托盘改用页面 favicon
+   上的鲸鱼：没有底板，按任务栏主题取黑 / 白两色 —— 白色圆角底在浅色通知区域里看不见，在深色
+   里又太扎眼。鲸鱼占画面 7/8，与桌面应用自带的 `tray.ico` 同尺寸；快捷方式图标画的是同一个
+   鲸鱼的 3/4，所以直接拿它当托盘图标会显得比官方小一圈。写快捷方式时会用
    `SHChangeNotify(SHCNE_ASSOCCHANGED)` 让资源管理器的图标缓存失效，否则会一直显示旧图标。
 
 ## 开发
@@ -180,15 +210,20 @@ dsh plugin --profile web remove dsh-web-tray
 ```sh
 npm install
 npm run typecheck     # 宿主端与客户端
-npm test              # 39 项测试（其中 6 项经 Windows interop 驱动真实托盘菜单，4 项覆盖图标）
+npm test              # 66 项测试（30 项产物文本、12 项服务生命周期、10 项经 Windows interop 驱动真实托盘菜单、6 项图标、8 项接线）
+DSH_WEB_TRAY_REQUIRE_INTEROP=1 npm test   # 缺 interop 时直接失败，而不是静默跳过
+                                      # （66 项中有 10 项需要 Windows，其余 56 项到处都能跑）
 npm run build         # tsc + tsdown + banner 规范化
 npm pack --dry-run
 ```
 
 `dsh-web-tray.ps1 -SelfTest` 会构建真实的 `NotifyIcon`、真实菜单和真实的快捷方式目标解析，
 但不显示任何 UI，并把结果契约写成 JSON。`tests/tray-menu.spec.ts` 经 Windows interop 运行它，
-断言菜单项、配色与尺寸（按真实 DPI 缩放）、目标路径和两个图标名；interop 不可用时自动跳过。
-`tests/icon-asset.spec.ts` 钉住两个 `.ico`：尺寸表、BMP/PNG 规则和配色方向。
+断言菜单项、配色与尺寸（按真实 DPI 缩放）、目标路径，以及托盘实际选用的图标与它读到的主题；
+interop 不可用时自动跳过（可用 `DSH_WEB_TRAY_REQUIRE_INTEROP=1` 把「跳过」变成失败）。
+`tests/icon-asset.spec.ts` 钉住三个 `.ico`：尺寸表、BMP/PNG 规则、鲸鱼在画面中的占比，以及
+黑 / 白两种墨色。`tests/service.spec.ts` 则针对临时 home 和注入的宿主桥驱动生命周期本身 ——
+幂等、旧版本残留、被换掉的快捷方式、并发生成只跑一次 —— 既不需要 Windows 也不需要 WSL。
 
 验证环境为 WSL2 + Windows 11、2560×1440 @ 100% DPI、dsh 0.2.0-rc.2：typecheck、
 测试、构建、打包全绿；真实托盘进程上打开、量测并关闭过菜单；双击真实 `.lnk` 不会出现控制台
@@ -202,6 +237,9 @@ npm pack --dry-run
 - **退出是“发完就不管”**：停止请求发出后托盘立刻关闭，WSL 那边稍后完成，因为没有任何东西
   在等它（这是刻意的）。手动执行 `bash ~/.dsh/dsh-web-tray/stop.sh` 效果相同。
 - **托盘不是守护进程**：DSH 崩了不会被重启。
+- **失败时降级而不是死掉**：深色菜单、窗口匹配、摘除控制台都来自同一份 `Add-Type` 源码；它编不过
+  时托盘照样出现（系统配色的菜单、没有圆角），并把原因写进 `tray.log`。任何未捕获的错误也会在
+  那里留一行 —— 隐藏进程失败与「根本没启动」本来无法区分。
 - **菜单是复刻而非系统菜单**，而且圆角完全没法复刻（Windows 给弹出窗口的就是 8 px 圆角，
   桌面端用 12 px；换来的是抗锯齿和真实阴影）。桌面端以后改版不会自动跟随：改
   `src/tray-script.ts` 里的常数即可。真要一字不差地复刻 Chromium 的绘制，就得打包
@@ -210,7 +248,20 @@ npm pack --dry-run
 - **打开依赖 `start.sh` 能拉起 CLI**：源码 checkout 必须已经构建过（`start.sh` 不会跑
   `src`；构建产物缺失时它会把原因写进 `start.log`）。不会在背后替你重新构建。
 - **不支持原生 Windows（非 WSL）**：这类宿主返回 `platform: 'unsupported'`，什么都不启动。
-- 用别的方式启动的 DSH 实例没有 PID 文件，`stop.sh` 会退回带方括号的 `pkill` 模式。
+- 用别的方式启动的 DSH 实例没有 PID 文件：`stop.sh` 会用 `pgrep` 列出所有 `dsh web` 进程，
+  逐个读 `/proc` 确认命令行确实是 DSH 才杀（你自己的 `grep dsh web` 不会被误杀）。
+- **只驱动浏览器**：托盘按窗口类匹配（`Chrome_WidgetWin_1`），而这个类并非浏览器独有 ——
+  QQ、Jitsi Meet、DSH 桌面端都画这种窗口。因此只有当窗口所属进程确实是浏览器时才认（可执行
+  文件名在白名单里，或命令行带 `--user-data-dir` / `--profile-directory`，便携版 / scoop
+  安装就是这样标识自己的）。
+- **任意 Chromium 内核浏览器，而不只是某一个**：Chrome、Edge、Brave、Vivaldi、Opera、
+  Chromium、ungoogled-chromium、Thorium、Yandex、Arc 都支持 `--app=<url>`，窗口类与刷新快捷键
+  也一致，所以同一套代码通吃。打开页面时优先用"已经看到过这个页面的那个浏览器"（连同它的
+  profile），其次才用默认浏览器（前提是它也是 Chromium 系），非 Chromium 默认浏览器才退回普通
+  打开（新标签页）。
+- **发行版名字里带空格的，托盘拉不起来**：`wsl.exe` 读的是原始命令行并会保留
+  `WScript.Shell.Run` 传过去的引号，`-d "My Distro"` 会被当成名为 `"My Distro"` 的发行版
+  并报 `WSL_E_DISTRO_NOT_FOUND`（实测）。因此发行版名按 WSL 的期望裸传。
 
 ## 与上游同步
 

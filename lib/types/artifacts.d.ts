@@ -7,6 +7,18 @@
 export * from './names.ts';
 export { buildTrayScript, wslLogUncPath } from './tray-script.ts';
 /**
+ * Quote a value for bash. JSON escaping is NOT shell escaping: inside double
+ * quotes bash still expands `$(...)`, backticks and `$VAR`, and it turns a
+ * newline into the two characters `\` and `n` — so a path containing either was
+ * executed or corrupted. Single quotes with `'\''` doubling keep every byte and
+ * expand nothing.
+ *
+ * The PowerShell counterpart is `psSingleQuoted` in tray-script.ts.
+ *
+ * @param value - the literal to quote.
+ */
+export declare function bashSingleQuoted(value: string): string;
+/**
  * Build the WSL-side launcher. It starts the same DSH web CLI the running
  * plugin host came from, waits for readiness, and opens the default browser.
  *
@@ -32,12 +44,14 @@ export declare function buildStartScript(params: {
 /**
  * Build the WSL-side stop script. It is what the tray's exit entry runs: the
  * generated script stops exactly the instance start.sh launched (PID file,
- * written before exec so it tracks the final DSH process), then falls back to a
- * pkill whose bracketed patterns cover every launcher flavor (source build
- * output, npm global, npx all end in `bin.js web`) without matching the
- * wsl.exe/bash wrapper that carries the pattern text in its own command line. A
- * dev instance started from source (`node --import tsx/esm .../src/bin.ts web`)
- * is covered by a second pattern.
+ * written before exec so it tracks the final DSH process), then falls back to
+ * every other `dsh web` process on the machine.
+ *
+ * The fallback enumerates candidates with pgrep and applies the same predicate
+ * the PID file gets — a global install's own command line is
+ * `node /usr/local/bin/dsh web` (the shim keeps the symlink path in argv), which
+ * none of the `bin.js web` patterns match, and a `grep dsh web` of your own is
+ * never signalled because the predicate inspects /proc, not the pattern text.
  *
  * The PID from the file is checked against /proc before anything is signalled: a
  * stale PID file plus a reused PID would otherwise kill an unrelated process.

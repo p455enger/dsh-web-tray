@@ -46,10 +46,26 @@ removed, and the platform defects below were fixed.
 - **New launcher**: the desktop shortcut runs `wscript.exe //E:JScript //B dsh-web-tray.js`
   instead of a `.vbs` (VBScript is an on-demand feature since Windows 11 24H2); the old
   `.vbs` is deleted.
-- **The notification icon is now the inverted mark** (`dsh-web-tray-inverted.ico`), so it
-  can be told apart from the desktop app's own tray icon.
+- **The notification icon changed twice**: the inverted tile in 0.2.0, then the theme-aware
+  favicon mark in 0.3.0 (see the next section).
 - **Regenerate the artifacts once** after upgrading: mounting the plugin does it, or click
   "recreate desktop shortcut" in the settings card.
+
+## Upgrading from 0.2.0
+
+0.3.0 fixes the Windows side of 0.2.0 and makes two visible changes:
+
+- **Tray icon**: the inverted tile gives way to the page's favicon mark — the bare whale, no
+  tile, drawn at the size the desktop app's own tray icon uses, in **black or white depending
+  on the taskbar theme** (one registry read every 5 s). `dsh-web-tray-inverted.ico` is deleted.
+- **New stamp**: `tray-shortcut.json` records what the desktop shortcut should be — target,
+  arguments, icon, and the `.lnk`'s own size and digest. A shortcut that was replaced,
+  restored from a backup or edited by hand is rebuilt instead of being trusted for existing.
+- **The 0.2.0 review fixes**: every value baked into a generated script is now shell-quoted,
+  `-Uninstall` covers the files older versions left behind, an unhandled error leaves a line
+  in `tray.log` instead of failing silently, artifacts are written atomically and
+  `regenerate()` is single-flight, `ensure()` notices leftovers, and the `pkill` fallback also
+  covers a globally installed `dsh`. No manual step: mounting regenerates.
 
 ## Requirements
 
@@ -76,13 +92,15 @@ PY
 mkdir -p "$P/node_modules" && ln -sfn /path/to/dsh-web-tray "$P/node_modules/dsh-web-tray"
 
 # C. tarball
-npm pack && dsh plugin --profile web add ./dsh-web-tray-0.2.0.tgz
+npm pack && dsh plugin --profile web add ./dsh-web-tray-0.3.0.tgz
 ```
 
 All three need a **restart of `dsh web`**. On first mount, `ensure()` writes every
 artifact and creates the desktop shortcut. Installing and regenerating are
-idempotent: the same bytes are written every time (only `tray.log` grows, by design)
-and a second mount starts no second tray.
+idempotent: `ensure()` compares the artifacts, the leftover files of older versions and
+the shortcut's own stamp, so nothing is rewritten, no second tray starts and no
+PowerShell runs — the only files that grow from normal use are `tray.log` and
+`start.log`.
 
 ## Uninstall
 
@@ -100,7 +118,7 @@ dsh plugin --profile web remove dsh-web-tray
 ```
 
 `-Uninstall` stops any tray started from that directory and deletes the desktop
-shortcut, the helper, the launcher, both icons, `tray.log`, `tray-selftest.json` and
+shortcut, the helper, the launcher, all three icons, `tray.log`, `tray-selftest.json` and
 the WSL directory (`start.sh`, `stop.sh`, `start.log`, `dsh.pid`,
 `project-path.json`). It leaves DSH itself running, and running it twice is harmless.
 Without it, all of the above stays behind — and keeps working, because the shortcut
@@ -117,14 +135,20 @@ them by hand if the profile is to be spotless.
 | File | Location |
 | --- | --- |
 | `dsh-web-tray.ps1` (tray helper), `dsh-web-tray.js` (hidden launcher) | `%USERPROFILE%\.dsh\dsh-web-tray\` |
-| `dsh-web-tray.ico` (shortcut icon), `dsh-web-tray-inverted.ico` (tray icon) | same |
+| `dsh-web-tray.ico` (shortcut icon), `dsh-web-tray-black.ico` / `dsh-web-tray-white.ico` (tray icon, one ink per taskbar theme) | same |
 | `tray.log` (one line per open/exit/error, not rotated) | same |
+| `tray-shortcut.json` (what the shortcut should be: target, arguments, icon, `.lnk` digest) | same |
 | `start.sh`, `stop.sh`, `start.log`, `dsh.pid` | `~/.dsh/dsh-web-tray/` |
 | `project-path.json` (only when a project path was saved) | `~/.dsh/dsh-web-tray/` |
 | `DSH Web.lnk` (targets `wscript.exe //E:JScript //B …dsh-web-tray.js`) | the Windows desktop |
 
 Running `dsh-web-tray.ps1 -SelfTest` writes `tray-selftest.json` (the menu contract,
 UTF-8) next to the helper.
+
+`~/.dsh/dsh-web-tray.env` (optional, `chmod 600`, one `KEY=VALUE` per line) is read by
+`start.sh` and exported into DSH's environment — a token for an MCP server, say. The
+script only reads it and never creates it; the older, personal
+`~/.dsh/github-mcp-token` is still honoured.
 
 ## How it works
 
@@ -169,8 +193,10 @@ desktop .lnk
   different program with its own backend, so its window is skipped by process name.
   `-SelfTest` reports what was found, and how many windows were skipped for that reason
   (`dshWindow`, `dshWindowIsWebApp`, `dshWindowsSkippedAsApp`, `focusReturned`).
-- **No background sampling**: no `netstat`, no polling loop, no status file, no
-  `/proc` scan. The UI thread probes once (≤ 2 s) when asked to open.
+- **No background sampling**: no `netstat`, no status file, no `/proc` scan. The UI
+  thread probes the URL once (≤ 2 s) when it is asked to open, and the open flow's 2 s
+  timer polls for up to 120 s while a DSH it started comes up. Nothing else runs in the
+  background except one registry read every 5 s for the taskbar theme.
 - **Single instance**: the `Local\dsh-web-tray-single` mutex. A second double-click
   while the tray runs creates no second tray; that process just opens DSH.
 
@@ -186,8 +212,10 @@ desktop .lnk
 
 1. **`powershell.exe` missing from PATH** (`.wslconfig` with
    `appendWindowsPath = false`) → shortcut creation, desktop resolution and profile
-   resolution all failed. It is now resolved from PATH first, then from
-   `/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`.
+   resolution all failed. Every mounted drive's absolute
+   `/mnt/<drive>/Windows/System32/WindowsPowerShell/v1.0/powershell.exe` is now tried
+   first and the bare name last: a PATH that does carry Windows still works, and so
+   does a Windows installed on another drive.
 2. **Profile resolution picked `Administrator`** (the first entry in `/mnt/c/Users`,
    not writable) → ask PowerShell for `[Environment]::GetFolderPath('UserProfile')`
    first; the directory scan is a last resort.
@@ -198,17 +226,30 @@ desktop .lnk
    `wscript.exe //E:JScript //B …`, which names the engine explicitly. The shortcut
    creation probes the engine and only falls back to a hidden `powershell.exe` when
    JScript is missing too; the old `.vbs` is deleted on regeneration.
-5. **Icons**: the shortcut gets the DSH app style (light tile, dark whale, 16–256) and
-   the tray the inverted twin (dark tile, light whale, 16–64), so the two are
-   distinguishable. Writing the shortcut invalidates the shell icon cache with
-   `SHChangeNotify(SHCNE_ASSOCCHANGED)`, or Explorer keeps showing the old art.
+5. **A cmdlet was missing in the PowerShell the host spawns**: this machine also has
+   PowerShell 7 installed, and a Windows process launched from WSL inherits the *user*
+   environment, so 5.1 was handed a module path that starts with 7's module
+   directories. `Get-FileHash` then reported "not recognized" while its module listed
+   itself as loaded, the shortcut stamp was never written, and every mount regenerated
+   the whole install. The helper now points its own `PSModulePath` at `$PSHOME\Modules`
+   and computes the `.lnk` digest with .NET.
+6. **Icons**: the shortcut gets the DSH app style (light tile, dark whale, 16–256). The
+   tray gets the page's favicon mark instead — the bare whale, no tile, in the ink the
+   taskbar theme needs — because a white tile is invisible on a white notification area
+   and glaring on a dark one. It is drawn 7/8 of the frame wide, the size the desktop
+   app's own `tray.ico` uses; the launcher asset draws the same whale at 3/4, which is
+   why an icon taken from that one looked small next to the app's. Writing the shortcut
+   invalidates the shell icon cache with `SHChangeNotify(SHCNE_ASSOCCHANGED)`, or
+   Explorer keeps showing the old art.
 
 ## Development
 
 ```sh
 npm install
 npm run typecheck     # host and client halves
-npm test              # 39 tests (6 drive the real tray menu through Windows interop, 4 cover the icons)
+npm test              # 66 tests (30 generated scripts, 12 service lifecycle, 10 real tray menu via Windows interop, 6 icons, 8 wiring)
+DSH_WEB_TRAY_REQUIRE_INTEROP=1 npm test   # fail instead of skipping when interop is missing
+                                      # (10 of the 66 need Windows; the other 56 run anywhere)
 npm run build         # tsc + tsdown + banner normalisation
 npm pack --dry-run
 ```
@@ -216,9 +257,13 @@ npm pack --dry-run
 `dsh-web-tray.ps1 -SelfTest` builds the real `NotifyIcon`, the real menu and the real
 shortcut-target resolution without showing UI, and writes the resulting contract as
 JSON. `tests/tray-menu.spec.ts` runs that through Windows interop and asserts the
-entries, the palette and metrics (scaled by the real DPI), the target path and both
-icon names; it is skipped where interop is unavailable. `tests/icon-asset.spec.ts`
-pins both `.ico` files: size tables, BMP/PNG rules and the colour direction.
+entries, the palette and metrics (scaled by the real DPI), the target path, and the tray
+icon it picked together with the theme it read; it is skipped where interop is
+unavailable. `tests/icon-asset.spec.ts` pins all three `.ico` files: size tables, BMP/PNG
+rules, the mark's share of its frame and the two inks. `tests/service.spec.ts` drives the
+lifecycle itself — idempotence, an older install's leftovers, a replaced shortcut,
+single-flight regenerate — against a temporary home directory and an injected host
+bridge, so it needs neither Windows nor WSL.
 
 Verified on WSL2 + Windows 11, 2560×1440 at 100% DPI, dsh 0.2.0-rc.2: typecheck,
 tests, build and pack green; the real menu opened, measured and closed again through
@@ -236,6 +281,11 @@ window; `/status` returns `platform: wsl` with every artifact present.
   immediately; WSL finishes a moment later, because nothing waits on it
   (deliberately). `bash ~/.dsh/dsh-web-tray/stop.sh` does the same by hand.
 - **The tray is not a supervisor**: a crashed DSH is not restarted.
+- **The helper degrades instead of dying**: the dark menu, the window matcher and the
+  console detach all come from one `Add-Type` source. If that does not compile, the tray
+  still appears — a system-colour menu, no rounded corners — and writes the reason to
+  `tray.log`. Any unhandled error leaves a line there too, because a hidden process
+  that fails is otherwise indistinguishable from one that never started.
 - **The menu is a copy, not the system menu**, and its corners cannot be copied at all
   (Windows rounds a popup by 8 px where the app uses 12; the trade is anti-aliasing and
   a real shadow). A future restyle of the desktop app does not propagate by itself:
@@ -247,8 +297,25 @@ window; `/status` returns `platform: wsl` with every artifact present.
   reason to `start.log`). Nothing rebuilds a checkout behind your back.
 - **Native Windows (non-WSL) is not implemented**: such a host reports
   `platform: 'unsupported'` and starts nothing.
-- DSH instances started by other means have no PID file; `stop.sh` then falls back to
-  bracketed `pkill` patterns.
+- DSH instances started by other means have no PID file; `stop.sh` then finds every
+  `dsh web` process with `pgrep` and kills the ones whose command line really is DSH
+  (read from `/proc`, so a `grep dsh web` of your own is never signalled).
+- **Only browsers are driven**: the tray matches windows by class
+  (`Chrome_WidgetWin_1`), and that class is not browser-only — QQ, Jitsi Meet and the DSH
+  desktop app itself draw windows with it. A window only counts as the page if its process
+  is a browser (a known executable name, or one started with `--user-data-dir` /
+  `--profile-directory`, which is how a portable or scoop install identifies itself).
+- **Any Chromium browser, not one of them**: Chrome, Edge, Brave, Vivaldi, Opera, Chromium,
+  ungoogled-chromium, Thorium, Yandex and Arc all take `--app=<url>` and share the window
+  class and the reload chord, so the same code serves all of them. The tray opens the page
+  in the browser it has already seen the page in (that window's own browser and profile), or
+  in the default browser when that one is Chromium-like, and only falls back to a plain open
+  (a new tab) for a non-Chromium default.
+- **A distro whose name contains a space cannot be launched from the tray**: `wsl.exe`
+  reads the raw command line and keeps the quotes `WScript.Shell.Run` passes, so
+  `-d "My Distro"` is read as a distro called `"My Distro"` and fails with
+  `WSL_E_DISTRO_NOT_FOUND` (measured). The name is therefore passed bare, exactly as
+  WSL expects it.
 
 ## Syncing with upstream
 

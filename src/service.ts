@@ -1,5 +1,5 @@
 /**
- * The WSL desktop/tray launcher service: writes the generated artifacts (both
+ * The WSL desktop/tray launcher service: writes the generated artifacts (three
  * icons, the Windows launcher, the tray helper, the WSL start and stop scripts)
  * and creates the desktop shortcut through a single PowerShell `-Regenerate`
  * run.
@@ -9,9 +9,10 @@
  * RSS poll on every status request was state nobody acted on.
  */
 
-import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import {
@@ -22,10 +23,12 @@ import {
   LEGACY_CONFIG_NAME,
   LEGACY_LAUNCHER_NAME,
   LEGACY_STATUS_NAME,
+  LEGACY_TRAY_FILE_NAMES,
+  SHORTCUT_STAMP_NAME,
   START_LOG_NAME,
   START_SCRIPT_NAME,
   STOP_SCRIPT_NAME,
-  TRAY_ICON_FILE_NAME,
+  TRAY_ICON_FILE_NAMES,
   TRAY_SCRIPT_NAME,
   WIN_DIR_REL,
   WSL_DIR_NAME,
@@ -35,13 +38,7 @@ import {
   buildTrayScript,
   type LaunchConfig,
 } from './artifacts.ts'
-import {
-  distroName,
-  isWsl,
-  runWindowsPowerShell,
-  windowsDesktopWslPath,
-  windowsUserProfileWslPathResolved,
-} from './windows.ts'
+import { distroName, windowsHostBridge, type TrayHostBridge } from './windows.ts'
 
 /** Which deployment this host serves. Windows-native is a later phase. */
 export type TrayPlatform = 'wsl' | 'win' | 'unsupported'
@@ -110,9 +107,12 @@ async function readIconBytes(name: string = ICON_FILE_NAME): Promise<Buffer | nu
   }
 }
 
-/** The WSL-side directory holding the generated start script. */
-export function wslAppDir(): string {
-  return join(homedir(), '.dsh', WSL_DIR_NAME)
+/**
+ * The WSL-side directory holding the generated start script.
+ * @param home - the user's home directory; the service passes the bridge's own.
+ */
+export function wslAppDir(home: string = homedir()): string {
+  return join(home, '.dsh', WSL_DIR_NAME)
 }
 
 /**
@@ -120,9 +120,9 @@ export function wslAppDir(): string {
  * is per-process, so only the newest line counts; without it the browser lands
  * on a 401 page.
  */
-export async function readWebAuthUrl(): Promise<string | null> {
+export async function readWebAuthUrl(appDir: string = wslAppDir()): Promise<string | null> {
   try {
-    const raw = await readFile(join(wslAppDir(), START_LOG_NAME), 'utf8')
+    const raw = await readFile(join(appDir, START_LOG_NAME), 'utf8')
     const tail = raw.split(/\r?\n/).slice(-200)
     for (let index = tail.length - 1; index >= 0; index--) {
       const match = /http:\/\/127\.0\.0\.1:\d+\/\?token=[A-Za-z0-9_-]+/.exec(tail[index])
@@ -253,6 +253,53 @@ export function configuredPathProblem(configuredPath: string): string | null {
 }
 
 /**
+ * Write in the same directory and rename into place, so a reader (notably the
+ * PowerShell run that follows, and the settings card polling `/status`) sees either
+ * the old file or the new one, never half of either.
+ */
+async function writeFileAtomic(path: string, data: string | Buffer): Promise<void> {
+  const temp = `${path}.tmp-${String(process.pid)}-${Math.random().toString(36).slice(2)}`
+  await writeFile(temp, data)
+  await rename(temp, path)
+}
+
+/**
+ * What the helper recorded about the desktop shortcut it wrote. `shortcut` and `icon`
+ * are file names (the helper knows the Windows path, this host the WSL one) and the
+ * digest is what actually decides staleness; `target` and `arguments` are kept for
+ * whoever reads the file.
+ */
+interface ShortcutStamp {
+  shortcut?: unknown
+  icon?: unknown
+  target?: unknown
+  arguments?: unknown
+  lnkBytes?: unknown
+  lnkSha256?: unknown
+}
+
+/**
+ * Whether the shortcut on disk is still the one the helper wrote. The stamp carries
+ * the `.lnk`'s own size and digest, which is what makes this answer a real one: a
+ * shortcut that was replaced, restored from a backup, or pointed at the old `.vbs` by
+ * another tool is rebuilt on the next mount instead of being trusted for existing.
+ */
+function shortcutIsCurrent(trayDir: string, shortcutPath: string, iconPath: string): boolean {
+  try {
+    const raw = readFileSync(join(trayDir, SHORTCUT_STAMP_NAME), 'utf8').replace(/^\uFEFF/, '')
+    const stamp = JSON.parse(raw) as ShortcutStamp
+    if (stamp.shortcut !== basename(shortcutPath) || stamp.icon !== basename(iconPath)) return false
+    if (typeof stamp.lnkBytes !== 'number' || typeof stamp.lnkSha256 !== 'string') return false
+    const lnk = readFileSync(shortcutPath)
+    if (lnk.length !== stamp.lnkBytes) return false
+    const digest = createHash('sha256').update(lnk).digest('hex')
+    return digest.toLowerCase() === stamp.lnkSha256.toLowerCase()
+  } catch {
+    return false
+  }
+}
+
+/**
  * Owns the generated files and the shortcut lifecycle for one plugin mount.
  * All Windows process launches are fenced by the helpers in windows.ts.
  */
@@ -261,20 +308,30 @@ export class TrayService {
 
   private cachedWindowsDir: string | null | undefined
 
+  private cachedProfileDir: string | null | undefined
+
+  private regenerating: Promise<TrayStatus> | null = null
+
   private projectPath: string
 
   constructor(
     private readonly ctx: TrayServiceContext,
     private readonly webServer: WebServerLike,
     private readonly shortcutName: string = DEFAULT_SHORTCUT_NAME,
+    private readonly bridge: TrayHostBridge = windowsHostBridge(),
   ) {
     this.projectPath = this.readProjectPathFromDisk()
+  }
+
+  /** The WSL-side directory this service owns, under the bridge's home. */
+  private appDir(): string {
+    return wslAppDir(this.bridge.homeDir())
   }
 
   /** Read the persisted source-project path, defaulting to empty (auto-detect). */
   private readProjectPathFromDisk(): string {
     try {
-      const parsed: unknown = JSON.parse(readFileSync(join(wslAppDir(), 'project-path.json'), 'utf8'))
+      const parsed: unknown = JSON.parse(readFileSync(join(this.appDir(), 'project-path.json'), 'utf8'))
       if (parsed !== null && typeof parsed === 'object' && typeof (parsed as Record<string, unknown>).projectPath === 'string') {
         return (parsed as Record<string, unknown>).projectPath as string
       }
@@ -292,8 +349,10 @@ export class TrayService {
   /** Persist the configured source-project path and keep it live for generation. */
   async setProjectPath(value: string): Promise<void> {
     this.projectPath = value.trim()
-    await mkdir(wslAppDir(), { recursive: true })
-    await writeFile(join(wslAppDir(), 'project-path.json'), JSON.stringify({ projectPath: this.projectPath }), 'utf8')
+    await mkdir(this.appDir(), { recursive: true })
+    // Atomic: a truncated file here is read back as "no project path" on the next
+    // mount, which silently reverts the user to auto-detection.
+    await writeFileAtomic(join(this.appDir(), 'project-path.json'), JSON.stringify({ projectPath: this.projectPath }))
   }
 
   /**
@@ -304,33 +363,43 @@ export class TrayService {
    */
   private async windowsAppDir(): Promise<string | null> {
     if (this.cachedWindowsDir !== undefined) return this.cachedWindowsDir
-    const profile = await windowsUserProfileWslPathResolved()
+    const profile = await this.windowsProfileDir()
     this.cachedWindowsDir = profile === null ? null : join(profile, ...WIN_DIR_REL.split('/'))
     return this.cachedWindowsDir
+  }
+
+  /**
+   * The Windows user profile, resolved once per mount: the PowerShell fallback costs
+   * seconds, and `/status` is fetched by the settings card.
+   */
+  private async windowsProfileDir(): Promise<string | null> {
+    if (this.cachedProfileDir !== undefined) return this.cachedProfileDir
+    this.cachedProfileDir = await this.bridge.userProfileDir()
+    return this.cachedProfileDir
   }
 
   /** Resolve the desktop once per mount; PowerShell is authoritative. */
   async desktopDir(): Promise<string | null> {
     if (this.cachedDesktopDir !== undefined) return this.cachedDesktopDir
-    this.cachedDesktopDir = await windowsDesktopWslPath()
+    this.cachedDesktopDir = await this.bridge.desktopDir()
     return this.cachedDesktopDir
   }
 
   /** Read the current on-disk facts. */
   async status(): Promise<TrayStatus> {
-    const platform: TrayPlatform = isWsl() ? 'wsl' : 'unsupported'
+    const platform: TrayPlatform = this.bridge.isWsl() ? 'wsl' : 'unsupported'
     const desktopDir = await this.desktopDir()
-    const windowsProfileDir = await windowsUserProfileWslPathResolved()
+    const windowsProfileDir = await this.windowsProfileDir()
     const trayDir = await this.windowsAppDir()
-    const startScriptPath = join(wslAppDir(), START_SCRIPT_NAME)
-    const stopScriptPath = join(wslAppDir(), STOP_SCRIPT_NAME)
+    const startScriptPath = join(this.appDir(), START_SCRIPT_NAME)
+    const stopScriptPath = join(this.appDir(), STOP_SCRIPT_NAME)
     const shortcutPath = desktopDir === null ? null : join(desktopDir, `${this.shortcutName}.lnk`)
     return {
       ok: true,
       platform,
       distro: distroName(),
       webUrl: platform === 'wsl' ? webUrlFor(this.webServer) : DEFAULT_WEB_URL,
-      webAuthUrl: await readWebAuthUrl(),
+      webAuthUrl: await readWebAuthUrl(this.appDir()),
       shortcutName: this.shortcutName,
       windowsProfileDir,
       desktopDir,
@@ -341,7 +410,9 @@ export class TrayService {
         trayScriptExists: trayDir !== null && existsSync(join(trayDir, TRAY_SCRIPT_NAME)),
         launcherScriptExists: trayDir !== null && existsSync(join(trayDir, LAUNCHER_SCRIPT_NAME)),
         iconExists: trayDir !== null && existsSync(join(trayDir, ICON_FILE_NAME)),
-        trayIconExists: trayDir !== null && existsSync(join(trayDir, TRAY_ICON_FILE_NAME)),
+        // Both inks: the tray picks by taskbar theme and only falls back to the
+        // other file when one is missing.
+        trayIconExists: trayDir !== null && TRAY_ICON_FILE_NAMES.every(name => existsSync(join(trayDir, name))),
         startScriptPath,
         startScriptExists: existsSync(startScriptPath),
         stopScriptExists: existsSync(stopScriptPath),
@@ -368,9 +439,11 @@ export class TrayService {
       distro: distroName(),
       webUrl: webUrlFor(this.webServer),
       shortcutName: this.shortcutName,
-      wslStartScript: `~/.dsh/${WSL_DIR_NAME}/${START_SCRIPT_NAME}`,
-      wslStopScript: `~/.dsh/${WSL_DIR_NAME}/${STOP_SCRIPT_NAME}`,
-      wslStartLogPath: join(wslAppDir(), START_LOG_NAME),
+      // Absolute, not `~/...`: the helper passes these to bash, and a tilde only
+      // expands when it is unquoted — which it cannot be once the path needs quoting.
+      wslStartScript: join(this.appDir(), START_SCRIPT_NAME),
+      wslStopScript: join(this.appDir(), STOP_SCRIPT_NAME),
+      wslStartLogPath: join(this.appDir(), START_LOG_NAME),
     }
     return {
       startScript: buildStartScript({
@@ -404,26 +477,40 @@ export class TrayService {
     if (!filesExist) return this.regenerate()
     const current = this.currentScripts()
     if (current === null) return base
-    const stopScriptPath = join(wslAppDir(), STOP_SCRIPT_NAME)
+    const trayDir = base.files.trayDir
+    // A file an older version left behind — or one that was locked during the last
+    // upgrade — means this install is not current even when every byte below matches.
+    // regenerate() is what deletes them.
+    if (trayDir !== null && LEGACY_TRAY_FILE_NAMES.some(name => existsSync(join(trayDir, name)))) {
+      return this.regenerate()
+    }
+    // The shortcut is not one of those bytes: its target can be wrong while every
+    // generated file is exactly right, which "the .lnk exists" cannot see.
+    if (trayDir !== null
+      && (base.files.shortcutPath === null
+        || !shortcutIsCurrent(trayDir, base.files.shortcutPath, join(trayDir, ICON_FILE_NAME)))) {
+      return this.regenerate()
+    }
+    const stopScriptPath = join(this.appDir(), STOP_SCRIPT_NAME)
     try {
       const startMatches = await readFile(base.files.startScriptPath, 'utf8') === current.startScript
       if (!startMatches) return this.regenerate()
       const stopMatches = await readFile(stopScriptPath, 'utf8') === current.stopScript
       if (!stopMatches) return this.regenerate()
-      if (base.files.trayDir !== null) {
-        const trayPath = join(base.files.trayDir, TRAY_SCRIPT_NAME)
+      if (trayDir !== null) {
+        const trayPath = join(trayDir, TRAY_SCRIPT_NAME)
         // The file is written with a UTF-8 BOM for Windows PowerShell 5.1.
         const trayMatches = await readFile(trayPath, 'utf8').then(text => text.replace(/^\uFEFF/, '') === current.trayScript)
         if (!trayMatches) return this.regenerate()
-        const launcherPath = join(base.files.trayDir, LAUNCHER_SCRIPT_NAME)
+        const launcherPath = join(trayDir, LAUNCHER_SCRIPT_NAME)
         const launcherMatches = await readFile(launcherPath, 'utf8') === current.launcher
         if (!launcherMatches) return this.regenerate()
         // Bytes, not presence: restyled icons have to reach an existing install,
         // and the shortcut Explorer caches is what the user sees.
-        for (const name of [ICON_FILE_NAME, TRAY_ICON_FILE_NAME]) {
+        for (const name of [ICON_FILE_NAME, ...TRAY_ICON_FILE_NAMES]) {
           const expected = await readIconBytes(name)
           const matches = expected !== null
-            && await readFile(join(base.files.trayDir, name))
+            && await readFile(join(trayDir, name))
               .then(bytes => bytes.equals(expected))
               .catch(() => false)
           if (!matches) return this.regenerate()
@@ -435,8 +522,19 @@ export class TrayService {
     }
   }
 
-  /** Write all artifacts and create/refresh the desktop shortcut. */
-  async regenerate(): Promise<TrayStatus> {
+  /**
+   * Write all artifacts and create/refresh the desktop shortcut.
+   *
+   * Single-flight: two mounts, or a mount racing the settings card's button, must not
+   * write the same files (and the same `.lnk`) at the same time.
+   */
+  regenerate(): Promise<TrayStatus> {
+    if (this.regenerating !== null) return this.regenerating
+    this.regenerating = this.regenerateOnce().finally(() => { this.regenerating = null })
+    return this.regenerating
+  }
+
+  private async regenerateOnce(): Promise<TrayStatus> {
     const base = await this.status()
     if (base.platform !== 'wsl') {
       return {
@@ -458,7 +556,7 @@ export class TrayService {
       return { ...base, ok: false, lastError: pathProblem }
     }
     const icons: Array<[string, Buffer]> = []
-    for (const name of [ICON_FILE_NAME, TRAY_ICON_FILE_NAME]) {
+    for (const name of [ICON_FILE_NAME, ...TRAY_ICON_FILE_NAMES]) {
       const bytes = await readIconBytes(name)
       if (bytes === null) {
         return {
@@ -470,7 +568,7 @@ export class TrayService {
       icons.push([name, bytes])
     }
 
-    const wslStartDir = wslAppDir()
+    const wslStartDir = this.appDir()
     const scripts = this.currentScripts()
     if (scripts === null) {
       return {
@@ -484,27 +582,29 @@ export class TrayService {
       await mkdir(trayDir, { recursive: true })
       await mkdir(wslStartDir, { recursive: true })
       for (const [name, bytes] of icons) {
-        await writeFile(join(trayDir, name), bytes)
+        await writeFileAtomic(join(trayDir, name), bytes)
       }
       // The BOM is required: without it Windows PowerShell 5.1 reads the
       // Chinese menu labels as ANSI and the script fails to parse.
-      await writeFile(join(trayDir, TRAY_SCRIPT_NAME), '\uFEFF' + scripts.trayScript, 'utf8')
+      await writeFileAtomic(join(trayDir, TRAY_SCRIPT_NAME), '\uFEFF' + scripts.trayScript)
       // Plain ASCII, no BOM: Windows Script Host reads a .js launcher as ANSI,
       // and a BOM would be a syntax error for it.
-      await writeFile(join(trayDir, LAUNCHER_SCRIPT_NAME), scripts.launcher, 'utf8')
-      // An install from before the JScript launcher keeps a .vbs that the
-      // shortcut no longer points at, and one from before the simplification
-      // keeps a switch and a status file nothing reads any more.
-      for (const legacy of [LEGACY_LAUNCHER_NAME, LEGACY_CONFIG_NAME, LEGACY_STATUS_NAME]) {
+      await writeFileAtomic(join(trayDir, LAUNCHER_SCRIPT_NAME), scripts.launcher)
+      // An install from before the JScript launcher keeps a .vbs that the shortcut no
+      // longer points at, one from before the simplification keeps a switch and a
+      // status file nothing reads any more, and one from before the favicon mark keeps
+      // the inverted tile the tray no longer loads. One list, shared with the helper's
+      // -Uninstall and with ensure().
+      for (const legacy of LEGACY_TRAY_FILE_NAMES) {
         await rm(join(trayDir, legacy), { force: true })
       }
-      await writeFile(join(wslStartDir, START_SCRIPT_NAME), scripts.startScript, 'utf8')
+      await writeFileAtomic(join(wslStartDir, START_SCRIPT_NAME), scripts.startScript)
       await chmod(join(wslStartDir, START_SCRIPT_NAME), 0o755)
-      await writeFile(join(wslStartDir, STOP_SCRIPT_NAME), scripts.stopScript, 'utf8')
+      await writeFileAtomic(join(wslStartDir, STOP_SCRIPT_NAME), scripts.stopScript)
       await chmod(join(wslStartDir, STOP_SCRIPT_NAME), 0o755)
 
       const trayScriptWindowsPath = wslPathToWindowsPath(join(trayDir, TRAY_SCRIPT_NAME))
-      const result = await runWindowsPowerShell(['-File', trayScriptWindowsPath, '-Regenerate'], undefined, 30000)
+      const result = await this.bridge.runPowerShell(['-File', trayScriptWindowsPath, '-Regenerate'], undefined, 30000)
       if (result.code !== 0 || result.timedOut) {
         return {
           ...(await this.status()),

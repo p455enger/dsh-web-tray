@@ -1,22 +1,26 @@
 /**
- * Both bundled `.ico` assets are product assets with a contract worth pinning
- * down:
+ * The bundled `.ico` files are product assets with a contract worth pinning down:
  *
- * - the shortcut icon wears the DeepSeek Harness app style (dark whale on a
- *   light rounded tile) at every size the shell asks for under common DPI
- *   settings, and the frames a `System.Drawing` consumer can request (up to
- *   96px) are BMP, because the .NET icon decoder cannot read a PNG-compressed
- *   frame that large ("Requested range extends past the end of the array")
- *   while the shell renders PNG frames fine — so PNG stays for 128/256 only;
- * - the notification-area icon is the same mark with the colours inverted
- *   (light whale on a dark tile), which is what makes the tray distinguishable
- *   from the official desktop app's own tray icon.
+ * - the shortcut icon wears the DeepSeek Harness app style (dark whale on a light
+ *   rounded tile) at every size the shell asks for under common DPI settings, and
+ *   the frames a `System.Drawing` consumer can request (up to 96px) are BMP,
+ *   because the .NET icon decoder cannot read a PNG-compressed frame that large
+ *   ("Requested range extends past the end of the array") while the shell renders
+ *   PNG frames fine — so PNG stays for 128/256 only;
+ * - the two notification-area icons are the page's own favicon mark — the whale
+ *   alone, with no tile behind it — in the two inks a light or a dark notification
+ *   area needs, drawn at the size the desktop app's own `resources/tray.ico` uses.
  */
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
-import { ICON_FILE_NAME, TRAY_ICON_FILE_NAME } from '../src/names.ts'
+import {
+  ICON_FILE_NAME,
+  TRAY_ICON_BLACK_NAME,
+  TRAY_ICON_FILE_NAMES,
+  TRAY_ICON_WHITE_NAME,
+} from '../src/names.ts'
 
 const ASSETS = join(dirname(fileURLToPath(import.meta.url)), '..', 'assets')
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
@@ -67,6 +71,42 @@ function luminance(pixel: [number, number, number, number]): number {
   return 0.299 * pixel[0] + 0.587 * pixel[1] + 0.114 * pixel[2]
 }
 
+/** The alpha-channel bounding box of a frame: the mark's own box in it. */
+function inkBox(icon: IconAsset, frame: Frame): { width: number; height: number } {
+  let left = frame.size
+  let top = frame.size
+  let right = -1
+  let bottom = -1
+  for (let y = 0; y < frame.size; y++) {
+    for (let x = 0; x < frame.size; x++) {
+      if (icon.pixel(frame, x, y)[3] <= 8) continue
+      if (x < left) left = x
+      if (x > right) right = x
+      if (y < top) top = y
+      if (y > bottom) bottom = y
+    }
+  }
+  if (right < 0) return { width: 0, height: 0 }
+  return { width: right - left + 1, height: bottom - top + 1 }
+}
+
+/** Every pixel's alpha, top-down: two icons that differ in ink only share it. */
+function alphaMap(icon: IconAsset, frame: Frame): number[] {
+  const alphas: number[] = []
+  for (let y = 0; y < frame.size; y++) {
+    for (let x = 0; x < frame.size; x++) alphas.push(icon.pixel(frame, x, y)[3])
+  }
+  return alphas
+}
+
+/** One frame of an asset, by its size. */
+function frameOf(icon: IconAsset, size: number): Frame {
+  const frame = icon.frames.find(entry => entry.size === size)
+  expect(frame).toBeDefined()
+  if (frame === undefined) throw new Error(`no ${String(size)} frame`)
+  return frame
+}
+
 describe('bundled icons', () => {
   it('ships every shortcut size the shell asks for, smallest first', () => {
     const icon = load(ICON_FILE_NAME)
@@ -108,21 +148,57 @@ describe('bundled icons', () => {
     expect(luminance(whale)).toBeLessThan(90)
   })
 
-  it('inverts the shortcut mark for the notification area, in BMP only', () => {
-    const icon = load(TRAY_ICON_FILE_NAME)
-    expect(icon.frames.map(frame => frame.size)).toEqual([16, 20, 24, 32, 40, 48, 64])
-    for (const frame of icon.frames) {
-      expect({ size: frame.size, png: frame.png }).toEqual({ size: frame.size, png: false })
+  it('ships the favicon mark in both tray inks, BMP only, at the tray frame sizes', () => {
+    for (const name of TRAY_ICON_FILE_NAMES) {
+      const icon = load(name)
+      expect(icon.frames.map(frame => frame.size)).toEqual([16, 20, 24, 32, 40, 48, 64])
+      for (const frame of icon.frames) {
+        expect({ size: frame.size, png: frame.png }).toEqual({ size: frame.size, png: false })
+      }
     }
-    const frame48 = icon.frames.find(entry => entry.size === 48)
-    expect(frame48).toBeDefined()
-    if (frame48 === undefined) return
-    // Same geometry, opposite colours: dark tile, light whale.
-    const tile = icon.pixel(frame48, 24, 4)
-    expect(tile[3]).toBeGreaterThan(240)
-    expect(luminance(tile)).toBeLessThan(90)
-    const whale = icon.pixel(frame48, 24, 22)
-    expect(whale[3]).toBe(255)
-    expect(luminance(whale)).toBeGreaterThan(200)
+  })
+
+  it('draws that mark at the size the desktop app tray gives it, over no tile', () => {
+    // The official `resources/tray.ico` draws this whale 7/8 of the frame wide
+    // (measured 28/32, 42/48 and 56/64); the launcher asset above draws the same
+    // mark at 3/4, which is a whole size smaller in the notification area.
+    for (const name of TRAY_ICON_FILE_NAMES) {
+      const icon = load(name)
+      for (const frame of icon.frames) {
+        const box = inkBox(icon, frame)
+        const expected = Math.round(frame.size * 7 / 8)
+        expect(box.width).toBeGreaterThanOrEqual(expected - 1)
+        expect(box.width).toBeLessThanOrEqual(expected)
+        // The favicon's own ink box is 48.3 x 36.3 units: a whale, not a square.
+        expect(box.height / box.width).toBeGreaterThan(0.70)
+        expect(box.height / box.width).toBeLessThan(0.82)
+      }
+    }
+    // No tile: the corners are transparent and only the mark carries alpha, which
+    // is what makes this a bare whale rather than the shortcut's rounded tile.
+    const icon = load(TRAY_ICON_BLACK_NAME)
+    const frame = frameOf(icon, 48)
+    for (const corner of [[0, 0], [47, 0], [0, 47], [47, 47]]) {
+      expect(icon.pixel(frame, corner[0] as number, corner[1] as number)[3]).toBe(0)
+    }
+    expect(icon.pixel(frame, 24, 24)[3]).toBe(255)
+  })
+
+  it('inks the two tray icons black and white, over one shared alpha map', () => {
+    const black = load(TRAY_ICON_BLACK_NAME)
+    const white = load(TRAY_ICON_WHITE_NAME)
+    for (const size of [16, 48]) {
+      const blackFrame = frameOf(black, size)
+      const whiteFrame = frameOf(white, size)
+      expect(alphaMap(white, whiteFrame)).toEqual(alphaMap(black, blackFrame))
+      // Body pixel: the same place, the two inks.
+      const middle = size / 2
+      const dark = black.pixel(blackFrame, middle, middle)
+      const light = white.pixel(whiteFrame, middle, middle)
+      expect(dark[3]).toBe(255)
+      expect(light[3]).toBe(255)
+      expect(luminance(dark)).toBeLessThan(20)
+      expect(luminance(light)).toBeGreaterThan(235)
+    }
   })
 })

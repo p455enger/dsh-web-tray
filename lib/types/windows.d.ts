@@ -13,7 +13,7 @@ export interface ExecResult {
     /** Whether the configured timeout killed the process. */
     timedOut: boolean;
 }
-/** The Windows PowerShell executable: PATH first, then the absolute paths. */
+/** The Windows PowerShell executable: an absolute path when one exists, else the name. */
 export declare function powershellPath(): string;
 /**
  * Run a Windows PowerShell process from WSL through the interop launcher.
@@ -48,6 +48,26 @@ export declare function windowsPathToWslPath(windowsPath: string): Promise<strin
  * back to the conventional profile/Desktop, then profile/OneDrive/Desktop.
  */
 export declare function windowsDesktopWslPath(): Promise<string | null>;
+/**
+ * Every host fact and Windows-facing operation the tray service performs, as one
+ * object. The service's lifecycle (idempotence, migration from an older install, the
+ * shortcut) is the part worth testing, and it can only be tested by substituting
+ * these — a test host is not WSL and has no PowerShell.
+ */
+export interface TrayHostBridge {
+    /** Whether this host runs inside WSL: the only platform this version writes for. */
+    isWsl(): boolean;
+    /** WSL-side home directory; the `~/.dsh/dsh-web-tray` tree lives under it. */
+    homeDir(): string;
+    /** Windows user profile as a WSL path, or null when it cannot be resolved. */
+    userProfileDir(): Promise<string | null>;
+    /** Windows desktop as a WSL path, or null when it cannot be resolved. */
+    desktopDir(): Promise<string | null>;
+    /** Run Windows PowerShell with a hard timeout. */
+    runPowerShell(args: readonly string[], script: string | undefined, timeoutMs: number): Promise<ExecResult>;
+}
+/** The real bridge: this machine's WSL, file system and PowerShell. */
+export declare function windowsHostBridge(): TrayHostBridge;
 /** Pick a single plausible Windows user profile when the PATH probe failed. */
 export declare function fallbackWindowsProfileWslPath(): string | null;
 /**

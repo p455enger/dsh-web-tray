@@ -5,6 +5,7 @@
 
 import { execFile, spawn } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 /** Result of a Windows process launch. */
@@ -20,23 +21,44 @@ export interface ExecResult {
 }
 
 /**
- * Absolute Windows PowerShell hosts, in preference order. Needed because
- * `appendWindowsPath = false` leaves Windows directories out of PATH, so
- * spawning the bare name fails with ENOENT on exactly the deployments this
- * plugin targets.
+ * Absolute Windows PowerShell hosts, in preference order, for every drive WSL has
+ * mounted. Absolute paths come first because `appendWindowsPath = false` leaves
+ * Windows directories out of PATH, so spawning the bare name fails with ENOENT on
+ * exactly the deployments this plugin targets; the bare name stays as the last
+ * candidate for a host whose PATH does carry Windows.
+ *
+ * Hardcoding C: made the absolute fallback silently useless on a machine whose
+ * Windows lives on another drive, so the drive list comes from the mounts (and from
+ * PATH, which names them too).
  */
-const POWERSHELL_CANDIDATES = [
-  '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe',
-  '/mnt/c/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell.exe',
-] as const
+function powershellCandidates(): string[] {
+  const drives = new Set<string>(['c'])
+  for (const entry of (process.env.PATH ?? '').split(':')) {
+    const match = /^\/mnt\/([a-zA-Z])(?:\/|$)/.exec(entry)
+    if (match !== null) drives.add(match[1].toLowerCase())
+  }
+  try {
+    for (const match of readFileSync('/proc/mounts', 'utf8').matchAll(/\/mnt\/([a-zA-Z])[\s/]/g)) {
+      drives.add(match[1].toLowerCase())
+    }
+  } catch {
+    // No /proc/mounts: PATH and the C: default are all we have.
+  }
+  const candidates = [...drives].flatMap(drive => [
+    `/mnt/${drive}/Windows/System32/WindowsPowerShell/v1.0/powershell.exe`,
+    `/mnt/${drive}/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell.exe`,
+  ])
+  candidates.push('powershell.exe')
+  return candidates
+}
 
 let cachedPowerShell: string | undefined
 
-/** The Windows PowerShell executable: PATH first, then the absolute paths. */
+/** The Windows PowerShell executable: an absolute path when one exists, else the name. */
 export function powershellPath(): string {
   if (cachedPowerShell !== undefined) return cachedPowerShell
-  for (const candidate of POWERSHELL_CANDIDATES) {
-    if (existsSync(candidate)) {
+  for (const candidate of powershellCandidates()) {
+    if (candidate === 'powershell.exe' || existsSync(candidate)) {
       cachedPowerShell = candidate
       return candidate
     }
@@ -57,9 +79,15 @@ export function powershellPath(): string {
  */
 export function runWindowsPowerShell(args: readonly string[], script?: string, timeoutMs = 20000): Promise<ExecResult> {
   return new Promise((resolve) => {
-    const child = spawn(powershellPath(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', ...args], {
+    const child = spawn(powershellPath(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', ...args], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      // PSModulePath is deliberately NOT set here: a Windows process launched from WSL
+      // takes its environment from the Windows user profile, and a value passed from
+      // this side is ignored (measured — removing it and setting it both changed
+      // nothing). A machine with PowerShell 7 installed therefore hands 5.1 a module
+      // path that starts with 7's directories and some cmdlets stop resolving; the
+      // generated helper normalises the variable for itself.
     })
     let stdout = ''
     let stderr = ''
@@ -130,7 +158,9 @@ export async function windowsPathToWslPath(windowsPath: string): Promise<string 
   const trimmed = windowsPath.trim().replace(/"/g, '')
   if (trimmed === '') return null
   return new Promise((resolve) => {
-    execFile('wslpath', ['-u', windowsPath], { timeout: 5000 }, (error, stdout) => {
+    // The trimmed value is the one that was checked: passing the raw string could
+    // hand wslpath a stray quote or a newline.
+    execFile('wslpath', ['-u', trimmed], { timeout: 5000 }, (error, stdout) => {
       if (error !== null) { resolve(null); return }
       const line = stdout.trim()
       resolve(line === '' ? null : line)
@@ -157,11 +187,48 @@ export async function windowsDesktopWslPath(): Promise<string | null> {
     }
   }
   if (profile === null) return null
-  const direct = join(profile, 'Desktop')
-  if (existsSync(direct)) return direct
-  const oneDrive = join(profile, 'OneDrive', 'Desktop')
-  if (existsSync(oneDrive)) return oneDrive
-  return direct
+  // Redirection first: a machine that moved its Desktop usually keeps an empty
+  // `%USERPROFILE%\Desktop` behind, and Explorer only shows the redirected one, so
+  // trying the conventional path first wrote the shortcut somewhere invisible.
+  // PowerShell's own answer above stays authoritative whenever interop works.
+  for (const candidate of [
+    join(profile, 'OneDrive', 'Desktop'),
+    join(profile, 'OneDriveCommercial', 'Desktop'),
+    join(profile, 'Desktop'),
+  ]) {
+    if (existsSync(candidate)) return candidate
+  }
+  return join(profile, 'Desktop')
+}
+
+/**
+ * Every host fact and Windows-facing operation the tray service performs, as one
+ * object. The service's lifecycle (idempotence, migration from an older install, the
+ * shortcut) is the part worth testing, and it can only be tested by substituting
+ * these — a test host is not WSL and has no PowerShell.
+ */
+export interface TrayHostBridge {
+  /** Whether this host runs inside WSL: the only platform this version writes for. */
+  isWsl(): boolean
+  /** WSL-side home directory; the `~/.dsh/dsh-web-tray` tree lives under it. */
+  homeDir(): string
+  /** Windows user profile as a WSL path, or null when it cannot be resolved. */
+  userProfileDir(): Promise<string | null>
+  /** Windows desktop as a WSL path, or null when it cannot be resolved. */
+  desktopDir(): Promise<string | null>
+  /** Run Windows PowerShell with a hard timeout. */
+  runPowerShell(args: readonly string[], script: string | undefined, timeoutMs: number): Promise<ExecResult>
+}
+
+/** The real bridge: this machine's WSL, file system and PowerShell. */
+export function windowsHostBridge(): TrayHostBridge {
+  return {
+    isWsl,
+    homeDir: homedir,
+    userProfileDir: windowsUserProfileWslPathResolved,
+    desktopDir: windowsDesktopWslPath,
+    runPowerShell: (args, script, timeoutMs) => runWindowsPowerShell(args, script, timeoutMs),
+  }
 }
 
 /** Pick a single plausible Windows user profile when the PATH probe failed. */
