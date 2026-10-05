@@ -1,7 +1,7 @@
 {
   "name": "dsh-web-tray",
   "description": "Windows tray icon and Start menu entry for `dsh web` running inside WSL — open and exit only, no watchdog (fork of dsh-wsl-tray)",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "license": "MIT",
   "author": "p455enger",
