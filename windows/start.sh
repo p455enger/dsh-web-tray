@@ -26,12 +26,16 @@ WORKSPACE="$(read_env WORKSPACE)"
 [ -n "$WORKSPACE" ] || WORKSPACE="$HOME"
 
 # Liveness probe with a dependency chain: curl, then wget, then bash's own /dev/tcp, so a
-# minimal distro without downloaders still detects a live instance.
+# minimal distro without downloaders still detects a live instance. Any HTTP response counts
+# as alive: DSH answers 401 without its cookie, and curl -f would call that a failure —
+# which started a second instance on an occupied port and lost the running one's token.
 is_ready() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsS -o /dev/null --max-time 2 "$URL" 2>/dev/null
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$URL" 2>/dev/null)"
+    [ -n "$code" ] && [ "$code" != "000" ]
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -T 2 -O /dev/null "$URL" 2>/dev/null
+    wget -S -q -O /dev/null -T 2 "$URL" 2>&1 | grep -q 'HTTP/'
   else
     local host port
     host="${URL#http://}"; host="${host%%/*}"
@@ -57,11 +61,12 @@ if [ -f "$HOME/.dsh/dsh-web-tray.env" ]; then
   set +a
 fi
 
-# The launch token belongs to the run that starts now, so the log starts a new one too.
+cd "$WORKSPACE" 2>/dev/null || { log "ERROR workspace does not exist: $WORKSPACE"; exit 1; }
+
+# Only now that this instance is really going to start. Truncating any earlier threw away the
+# running instance's token line when the launch then failed (occupied port, missing command).
 : >"$LOG_FILE"
 log "launching: $DSH_COMMAND (in $WORKSPACE)"
-
-cd "$WORKSPACE" 2>/dev/null || { log "ERROR workspace does not exist: $WORKSPACE"; exit 1; }
 # exec keeps this shell's PID, so the process the tray started is the one stop.sh finds;
 # the word splitting is intended — DSH_COMMAND is a command line, not a path.
 # shellcheck disable=SC2086

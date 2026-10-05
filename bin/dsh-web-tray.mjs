@@ -36,11 +36,16 @@ const START_MENU_DIR = 'AppData/Roaming/Microsoft/Windows/Start Menu/Programs'
 const WINDOWS_FILES = ['dsh-web-tray.ps1', 'dsh-web-tray.js', 'start.sh', 'stop.sh']
 export const ICON_FILES = ['dsh-web-tray.ico', 'dsh-web-tray-black.ico', 'dsh-web-tray-white.ico']
 
-/** Files this install owns, for uninstall and for the status listing. */
+/** What `install` writes; `status` checks completeness against this. */
+export const INSTALLED_FILES = [...WINDOWS_FILES, ...ICON_FILES, 'tray.env']
+
+/**
+ * Everything this install owns, including what the tray writes while it runs. `uninstall`
+ * removes this whole list; the run-time entries are absent until they are first written,
+ * which is why they are not part of the install-completeness check.
+ */
 export const OWNED_FILES = [
-  ...WINDOWS_FILES,
-  ...ICON_FILES,
-  'tray.env',
+  ...INSTALLED_FILES,
   SHORTCUT_STAMP,
   'start.log',
   'tray.log',
@@ -55,6 +60,7 @@ Commands
   install      Copy the tray into %USERPROFILE%\\.dsh\\${INSTALL_DIR_NAME} and write the
                Start menu shortcut (one Windows process, no install scripts)
   uninstall    Ask the tray to exit, then remove the shortcut and every installed file
+               (--stop-dsh stops DSH first, which is what releases the directory)
   status       Report the install, the shortcut, the configured URL and the last log lines
   open         Start DSH if it is not answering, then print its authorised URL
   stop         Stop the DSH web instance(s) started from this install
@@ -360,9 +366,42 @@ export async function install(options = {}) {
 }
 
 /**
+ * Remove a file or a directory, and report a refusal instead of throwing. On Windows a
+ * directory a running DSH still has open cannot be deleted, and that is not a failed
+ * uninstall.
+ * @param path - what to remove.
+ * @param log - where to report a refusal, or undefined to stay quiet.
+ * @param remove - the remover, injectable for tests.
+ * @returns whether it went away.
+ */
+export function tryRemove(path, log, remove = rmSync) {
+  try {
+    remove(path, { recursive: true, force: true })
+    return true
+  } catch (error) {
+    if (log !== undefined) log(`warning: could not remove ${path} (${error.code ?? error.message})`)
+    return false
+  }
+}
+
+/**
+ * Whether a tray is running from this install. One process query: without it, an uninstall
+ * on a machine with no tray waited out the whole handshake timeout for nothing.
+ * @param layout - from {@link resolveLayout}.
+ * @param options - injectable PowerShell runner.
+ */
+async function trayIsRunning(layout, options) {
+  const script = layout.trayScriptWindows
+  const query = `@(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { $_.CommandLine -like '*${script}*' }).Count`
+  const result = await (options.runPowerShell ?? defaultRunPowerShell)(['-Command', query], 20000)
+  return Number.parseInt(result.stdout.trim(), 10) > 0
+}
+
+/**
  * `uninstall`: ask the running tray to exit, then remove the shortcut and this install's
- * files. DSH itself is never touched.
- * @param options - `timeoutMs` for the tray handshake.
+ * files. DSH itself is never touched; pass `--stop-dsh` to stop it first, which is also what
+ * releases the install directory when DSH was started from it.
+ * @param options - `timeoutMs` for the tray handshake, `stopDsh` to stop DSH first.
  */
 export async function uninstall(options = {}) {
   const log = options.log ?? console.log
@@ -371,36 +410,48 @@ export async function uninstall(options = {}) {
     log(`nothing installed at ${layout.targetDirWindows}`)
     return { removed: [] }
   }
-  const shortcut = shortcutPathFromStamp(layout)
-  // The tray consumes this on its next tick and exits; waiting for that is what keeps the
-  // icon from lingering after its files are gone.
-  await writeFile(layout.exitFlagPath, 'exit\n', 'utf8')
-  const deadline = Date.now() + (options.timeoutMs ?? 10000)
-  while (existsSync(layout.exitFlagPath) && Date.now() < deadline) {
-    await new Promise(done => setTimeout(done, 250))
+  if (options.stopDsh === true) {
+    log('stopping DSH first, so nothing holds this directory')
+    runScript(layout, 'stop.sh')
+    await new Promise(done => setTimeout(done, 1500))
   }
-  if (existsSync(layout.exitFlagPath)) {
-    log('the tray did not exit on its own; stopping it')
-    const script = layout.trayScriptWindows
-    await (options.runPowerShell ?? defaultRunPowerShell)(['-Command',
-      `Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { $_.CommandLine -like '*${script}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`], 20000)
-    rmSync(layout.exitFlagPath, { force: true })
+  const shortcut = shortcutPathFromStamp(layout)
+  if (await trayIsRunning(layout, options)) {
+    // The tray consumes this on its next tick and exits; waiting for that is what keeps the
+    // icon from lingering after its files are gone.
+    await writeFile(layout.exitFlagPath, 'exit\n', 'utf8')
+    const deadline = Date.now() + (options.timeoutMs ?? 10000)
+    while (existsSync(layout.exitFlagPath) && Date.now() < deadline) {
+      await new Promise(done => setTimeout(done, 250))
+    }
+    if (existsSync(layout.exitFlagPath)) {
+      log('the tray did not exit on its own; stopping it')
+      const script = layout.trayScriptWindows
+      await (options.runPowerShell ?? defaultRunPowerShell)(['-Command',
+        `Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" | Where-Object { $_.CommandLine -like '*${script}*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }`], 20000)
+      rmSync(layout.exitFlagPath, { force: true })
+    }
   }
   const removed = []
   if (isRemovableShortcut(shortcut, layout.profile.wslPath) && existsSync(shortcut)) {
-    rmSync(shortcut, { force: true })
-    removed.push(shortcut)
+    if (tryRemove(shortcut, log)) removed.push(shortcut)
   }
   for (const name of OWNED_FILES) {
     const path = join(layout.targetDir, name)
-    if (existsSync(path)) {
-      rmSync(path, { force: true })
-      removed.push(path)
-    }
+    if (existsSync(path) && tryRemove(path, log)) removed.push(path)
   }
+  // A directory a running DSH still holds open cannot go; retry briefly, then say why.
   const leftovers = existsSync(layout.targetDir) ? readdirSync(layout.targetDir) : []
   if (leftovers.length === 0) {
-    rmSync(layout.targetDir, { recursive: true, force: true })
+    let gone = false
+    for (let attempt = 0; attempt < 4 && !gone; attempt++) {
+      gone = tryRemove(layout.targetDir, undefined)
+      if (!gone) await new Promise(done => setTimeout(done, 400))
+    }
+    if (!gone) {
+      log(`could not remove ${layout.targetDirWindows}: something still holds it open (a DSH instance started from this directory keeps its start.sh mapped on Windows)`)
+      log('  stop DSH and delete that directory, or re-run with: dsh-web-tray uninstall --stop-dsh')
+    }
   } else {
     log(`kept ${layout.targetDirWindows}: ${leftovers.join(', ')}`)
   }
@@ -454,9 +505,15 @@ export async function status(options = {}) {
     log('  not installed: run `dsh-web-tray install`')
     return { installed: false }
   }
-  const missing = OWNED_FILES.filter(name => !existsSync(join(layout.targetDir, name)))
-  const present = OWNED_FILES.filter(name => existsSync(join(layout.targetDir, name)))
-  log(`  ${present.length} of ${OWNED_FILES.length} files present${missing.length > 0 ? ` (missing: ${missing.join(', ')})` : ''}`)
+  const present = INSTALLED_FILES.filter(name => existsSync(join(layout.targetDir, name)))
+  if (present.length === 0) {
+    // A directory that exists but holds nothing this package wrote is a leftover, not an
+    // install: saying "0 of 8 files present" made a healthy machine look broken.
+    log('  not installed: nothing this package writes is in that directory')
+    return { installed: false }
+  }
+  const missing = INSTALLED_FILES.filter(name => !existsSync(join(layout.targetDir, name)))
+  log(`  ${present.length} of ${INSTALLED_FILES.length} installed files present${missing.length > 0 ? ` (missing: ${missing.join(', ')})` : ''}`)
   const env = existsSync(layout.trayEnvPath) ? parseEnv(readFileSync(layout.trayEnvPath, 'utf8')) : {}
   for (const [name, value] of Object.entries(env)) log(`  ${name}=${value}`)
   for (const name of ['tray.env', 'start.sh', 'stop.sh']) {
@@ -614,6 +671,7 @@ export function parseArgs(argv) {
     const flag = rest.shift()
     if (flag === '-h' || flag === '--help') { options.help = true; continue }
     if (flag === '-v' || flag === '--version') { options.version = true; continue }
+    if (flag === '--stop-dsh') { options.stopDsh = true; continue }
     if (!flag.startsWith('-')) { throw new Error(`unexpected argument: ${flag}`) }
     const value = rest.shift()
     if (value === undefined || value.startsWith('-')) throw new Error(`${flag} needs a value`)

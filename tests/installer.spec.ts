@@ -11,6 +11,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
+  INSTALLED_FILES,
   OWNED_FILES,
   envValue,
   installFiles,
@@ -21,6 +22,7 @@ import {
   resolveLayout,
   resolveWindowsProfile,
   shortcutPathFromStamp,
+  tryRemove,
   tokenUrl,
   windowsDirToWsl,
   wslDirToWindows,
@@ -222,6 +224,29 @@ describe('reading back what was installed', () => {
     writeFileSync(stampPath, '{}', 'utf8')
     expect(shortcutPathFromStamp({ ...layout, stampPath })).toBe(`${programs}/DeepSeek Harness (Web).lnk`)
     expect(shortcutPathFromStamp({ ...layout, stampPath: join(tmp, 'missing.json') })).toBe(`${programs}/DeepSeek Harness (Web).lnk`)
+  })
+
+  it('removes what it can and reports what it cannot, instead of throwing', () => {
+    // The real case: a directory a running DSH still holds open. Windows refuses, and that is
+    // not a failed uninstall — so the remover is injectable and the refusal is reported.
+    const spoken: string[] = []
+    const refuses = () => { const error = new Error('busy') as Error & { code?: string }; error.code = 'EACCES'; throw error }
+    expect(tryRemove('/somewhere/dsh-web-tray', (message: string) => { spoken.push(message) }, refuses)).toBe(false)
+    expect(spoken.join(' ')).toContain('EACCES')
+    // And a working remover still reports success, quietly.
+    expect(tryRemove('/somewhere/gone', undefined, () => {})).toBe(true)
+  })
+
+  it('keeps the install list and the owned list straight', () => {
+    // status must not call a healthy install incomplete because the tray has not written its
+    // run-time files yet; uninstall must still remove them when they exist.
+    expect(INSTALLED_FILES).toContain('dsh-web-tray.ps1')
+    expect(INSTALLED_FILES).toContain('tray.env')
+    for (const runtimeOnly of ['start.log', 'tray.log', 'tray-selftest.json', 'tray-shortcut.json']) {
+      expect(INSTALLED_FILES).not.toContain(runtimeOnly)
+      expect(OWNED_FILES).toContain(runtimeOnly)
+    }
+    for (const name of INSTALLED_FILES) expect(OWNED_FILES).toContain(name)
   })
 
   it('leaves a file it does not own alone', async () => {
